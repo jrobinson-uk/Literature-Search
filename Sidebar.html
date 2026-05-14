@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      body { 
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+        padding: 15px; 
+        font-size: 13px; 
+        background-color: #f9f9f9; 
+        color: #333;
+      }
+      .field { margin-bottom: 15px; }
+      label { display: block; font-weight: bold; margin-bottom: 5px; color: #444; }
+      input, select { 
+        width: 100%; 
+        box-sizing: border-box; 
+        padding: 8px; 
+        border: 1px solid #ccc; 
+        border-radius: 4px; 
+      }
+      input:focus, select:focus {
+        border-color: #1a73e8;
+        outline: none;
+      }
+      .years { display: flex; gap: 10px; }
+      
+      /* Standard Search Button */
+      #searchBtn { 
+        width: 100%; 
+        background: #1a73e8; 
+        color: white; 
+        border: none; 
+        padding: 12px; 
+        cursor: pointer; 
+        border-radius: 4px; 
+        font-weight: bold;
+        transition: background 0.2s;
+      }
+      #searchBtn:hover { background: #1765cc; }
+      #searchBtn:disabled { background: #ccc; cursor: not-allowed; }
+
+      /* Load from Log Button */
+      #loadBtn { 
+        width: 100%;
+        background: #34a853; 
+        color: white;
+        border: none;
+        padding: 10px;
+        cursor: pointer;
+        border-radius: 4px;
+        font-weight: bold;
+        margin-bottom: 20px;
+        transition: background 0.2s;
+      }
+      #loadBtn:hover { background: #2d8e47; }
+      
+      hr { border: 0; border-top: 1px solid #ddd; margin: 20px 0; }
+      .hint { font-size: 11px; color: #777; font-style: italic; display: block; margin-top: 2px; }
+    </style>
+  </head>
+  <body>
+
+    <button id="loadBtn" onclick="loadFromLog()">📂 Load Selected Log Row</button>
+    
+    <hr>
+
+    <div class="field">
+      <label>All words</label>
+      <input type="text" id="allWords">
+    </div>
+
+    <div class="field">
+      <label>Exact phrase</label>
+      <input type="text" id="exact">
+    </div>
+
+    <div class="field">
+      <label>At least one of</label>
+      <input type="text" id="atLeast">
+      <span class="hint">e.g. malaria flu</span>
+    </div>
+
+    <div class="field">
+      <label>Without words</label>
+      <input type="text" id="without">
+    </div>
+
+    <div class="field">
+      <label>Where words occur</label>
+      <select id="scope">
+        <option value="anywhere">Anywhere in article</option>
+        <option value="title">In title of article</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label>Author</label>
+      <input type="text" id="author">
+    </div>
+
+    <div class="field">
+      <label>Published in (Source)</label>
+      <input type="text" id="source">
+    </div>
+
+    <div class="field">
+      <label>Year Range</label>
+      <div class="years">
+        <input type="number" id="ylo" placeholder="From">
+        <input type="number" id="yhi" placeholder="To">
+      </div>
+    </div>
+
+    <button id="searchBtn" onclick="submitForm()">Search Google Scholar</button>
+
+    <script>
+      /**
+       * Puts the sidebar back in a 'ready' state after an error or success
+       */
+      function resetButton() {
+        const btn = document.getElementById('searchBtn');
+        btn.innerText = "Search Google Scholar";
+        btn.disabled = false;
+      }
+
+      /**
+       * Fetches the raw search parameters from the selected row in the Log sheet
+       */
+      function loadFromLog() {
+        const btn = document.getElementById('loadBtn');
+        const originalText = btn.innerText;
+        btn.innerText = "Loading...";
+        
+        google.script.run
+          .withSuccessHandler(function(params) {
+            btn.innerText = originalText;
+            
+            if (!params || params.error) {
+              alert(params ? params.error : "Unknown error loading log.");
+              return;
+            }
+            
+            // Populate all fields using the hidden raw columns
+            document.getElementById('allWords').value = params.allWords || "";
+            document.getElementById('exact').value = params.exact || "";
+            document.getElementById('atLeast').value = params.atLeast || "";
+            document.getElementById('without').value = params.without || "";
+            document.getElementById('scope').value = params.scope || "anywhere";
+            document.getElementById('author').value = params.author || "";
+            document.getElementById('source').value = params.source || "";
+            document.getElementById('ylo').value = params.ylo || "";
+            document.getElementById('yhi').value = params.yhi || "";
+          })
+          .withFailureHandler(function(err) {
+            btn.innerText = originalText;
+            alert("Error communicating with script: " + err);
+          })
+          .getSelectionFromLog();
+      }
+
+      /**
+       * Sends all form data to the processSearch function in Code.gs
+       */
+      function submitForm() {
+        const btn = document.getElementById('searchBtn');
+        const data = {
+          allWords: document.getElementById('allWords').value,
+          exact: document.getElementById('exact').value,
+          atLeast: document.getElementById('atLeast').value,
+          without: document.getElementById('without').value,
+          scope: document.getElementById('scope').value,
+          author: document.getElementById('author').value,
+          source: document.getElementById('source').value,
+          ylo: document.getElementById('ylo').value,
+          yhi: document.getElementById('yhi').value
+        };
+
+        btn.innerText = "Processing...";
+        btn.disabled = true;
+
+        google.script.run
+          .withSuccessHandler(resetButton)
+          .withFailureHandler(function(err) {
+            alert("Search failed: " + err);
+            resetButton();
+          })
+          .processSearch(data);
+      }
+    </script>
+  </body>
+</html>

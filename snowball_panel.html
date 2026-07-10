@@ -3,49 +3,224 @@
   <head>
     <base target="_top">
     <style>
-      body { font-family: sans-serif; padding: 15px; background: #f4f7f6; }
-      .card { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
-      input { width: 100%; padding: 8px; margin: 10px 0; box-sizing: border-box; }
-      button { width: 100%; padding: 10px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; margin-bottom: 10px; }
-      .btn-start { background: #1a73e8; color: white; }
-      .btn-next { background: #34a853; color: white; }
-      #status { font-size: 12px; color: #666; font-style: italic; }
+      body { font-family: 'Segoe UI', sans-serif; padding: 15px; background: #f9f9f9; font-size: 13px; color: #333; }
+      h3   { margin: 0 0 4px 0; font-size: 14px; color: #1a73e8; }
+      p.hint { font-size: 11px; color: #777; margin: 0 0 10px 0; }
+
+      input[type="text"] {
+        width: 100%; box-sizing: border-box; padding: 8px;
+        border: 1px solid #ccc; border-radius: 4px; margin-bottom: 10px;
+      }
+      input[type="text"]:focus { border-color: #1a73e8; outline: none; }
+
+      button {
+        width: 100%; padding: 10px; border: none; border-radius: 4px;
+        cursor: pointer; font-weight: bold; margin-bottom: 10px;
+        transition: background 0.2s;
+      }
+      #seedBtn         { background: #1a73e8; color: white; }
+      #seedBtn:hover   { background: #1765cc; }
+      #expandBtn       { background: #34a853; color: white; }
+      #expandBtn:hover { background: #2d8e47; }
+      #filterBtn       { background: #f4b400; color: white; }
+      #filterBtn:hover { background: #d9a200; }
+      #addGroupBtn {
+        background: white; color: #1a73e8;
+        border: 1px dashed #1a73e8;
+        padding: 7px; margin-bottom: 8px;
+      }
+      #addGroupBtn:hover { background: #e8f0fe; }
+      button:disabled { background: #ccc !important; color: #fff !important; cursor: not-allowed; }
+
+      hr { border: 0; border-top: 1px solid #ddd; margin: 15px 0; }
+
+      .group-card {
+        background: white; border: 1px solid #ddd; border-radius: 6px;
+        padding: 8px 10px; margin-bottom: 6px;
+      }
+      .group-header {
+        display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+      }
+      .group-label { font-weight: bold; font-size: 11px; color: #555; flex: 1; }
+      .and-divider { text-align: center; font-size: 10px; font-weight: bold; color: #aaa; margin: 2px 0 6px 0; letter-spacing: 1px; }
+      .not-label   { font-size: 11px; display: flex; align-items: center; gap: 3px; white-space: nowrap; }
+      .remove-btn  {
+        background: none; border: none; color: #e53935;
+        cursor: pointer; font-size: 16px; padding: 0;
+        width: auto; margin: 0; line-height: 1;
+      }
+      .terms-input {
+        width: 100%; box-sizing: border-box; padding: 6px 8px;
+        border: 1px solid #ccc; border-radius: 4px;
+        font-size: 12px; font-family: monospace; margin: 0;
+      }
+      .terms-input:focus { border-color: #1a73e8; outline: none; }
+
+      #status {
+        font-size: 12px; color: #444; font-style: italic;
+        background: #fff; border: 1px solid #e0e0e0;
+        border-radius: 4px; padding: 8px; min-height: 36px;
+      }
     </style>
   </head>
   <body>
-    <div class="card">
-      <label><b>Step 1: Start Snowball</b></label>
-      <input type="text" id="seedInput" placeholder="Enter DOI or Title">
-      <button class="btn-start" onclick="start()">Initialize from Seed</button>
+
+    <!-- Step 1 -->
+    <h3>Step 1: Choose Direction</h3>
+    <div style="margin-bottom: 12px;">
+      <label style="display:inline-flex;align-items:center;gap:6px;margin-right:15px;cursor:pointer;">
+        <input type="radio" name="direction" value="backward" checked> Backward
+        <span style="font-size:11px;color:#777;">(what it cites)</span>
+      </label>
+      <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="radio" name="direction" value="forward"> Forward
+        <span style="font-size:11px;color:#777;">(what cites it)</span>
+      </label>
     </div>
 
-    <div class="card">
-      <label><b>Step 2: Expand</b></label>
-      <p style="font-size: 11px;">Select papers in the 'Include' column of your sheet first.</p>
-      <button class="btn-next" onclick="expand()">Fetch Next Level Citations</button>
-    </div>
+    <!-- Step 2 -->
+    <h3>Step 2: Seed Paper</h3>
+    <p class="hint">Enter a DOI or OpenAlex ID (e.g. W2741809807).</p>
+    <input type="text" id="seedInput" placeholder="DOI or OpenAlex ID">
+    <button id="seedBtn" onclick="start()">Initialize from Seed</button>
 
-    <div id="status">Ready...</div>
+    <hr>
+
+    <!-- Step 3 -->
+    <h3>Step 3: Expand</h3>
+    <p class="hint">Check papers to include, then click Expand to fetch the next round.</p>
+    <button id="expandBtn" onclick="expand()">Fetch Next Round</button>
+
+    <hr>
+
+    <!-- Step 4 -->
+    <h3>Step 4: Highlight Filter</h3>
+    <p class="hint">
+      Each card is an <strong>AND</strong> condition. Comma-separate terms within a card &mdash; they are <strong>OR</strong>'d together.
+      Tick <strong>NOT</strong> to exclude rows matching that card.
+    </p>
+
+    <div id="groupsContainer"></div>
+    <button id="addGroupBtn" onclick="addGroup()">+ Add AND Group</button>
+    <button id="filterBtn" onclick="applyFilter()">Apply Highlight Rule</button>
+
+    <hr>
+
+    <div id="status">Ready.</div>
 
     <script>
-      function start() {
-        const input = document.getElementById('seedInput').value;
-        updateStatus("Searching OpenAlex...");
+      var groupCount = 0;
+
+      function addGroup(data) {
+        groupCount++;
+        var container = document.getElementById('groupsContainer');
+
+        if (container.children.length > 0) {
+          var divider = document.createElement('div');
+          divider.className = 'and-divider';
+          divider.innerText = '— AND —';
+          container.appendChild(divider);
+        }
+
+        var id   = 'group-' + groupCount;
+        var card = document.createElement('div');
+        card.className = 'group-card';
+        card.id = id;
+        card.innerHTML =
+          '<div class="group-header">' +
+            '<span class="group-label">Group ' + groupCount + '</span>' +
+            '<label class="not-label"><input type="checkbox" class="notCheck"> NOT</label>' +
+            '<button class="remove-btn" onclick="removeGroup(\'' + id + '\')" title="Remove group">&#215;</button>' +
+          '</div>' +
+          '<input type="text" class="terms-input" placeholder=\'term A, "exact phrase", term C\'>';
+        container.appendChild(card);
+
+        if (data) {
+          card.querySelector('.terms-input').value = data.terms || '';
+          card.querySelector('.notCheck').checked  = !!data.not;
+        }
+      }
+
+      function removeGroup(id) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        var prev = el.previousElementSibling;
+        if (prev && prev.classList.contains('and-divider')) {
+          prev.remove();
+        } else {
+          var next = el.nextElementSibling;
+          if (next && next.classList.contains('and-divider')) next.remove();
+        }
+        el.remove();
+      }
+
+      function getGroupsFromPanel() {
+        var cards  = document.querySelectorAll('.group-card');
+        var groups = [];
+        cards.forEach(function(card) {
+          var terms = card.querySelector('.terms-input').value.trim();
+          var not   = card.querySelector('.notCheck').checked;
+          if (terms) groups.push({ terms: terms, not: not });
+        });
+        return groups;
+      }
+
+      function applyFilter() {
+        var groups    = getGroupsFromPanel();
+        var direction = document.querySelector('input[name="direction"]:checked').value;
+        if (groups.length === 0) { setStatus("Please add at least one group with terms."); return; }
+        setLoading(true);
+        setStatus("Applying highlight rule...");
         google.script.run
-          .withSuccessHandler(s => updateStatus(s))
-          .startSnowball(input);
+          .withSuccessHandler(function(msg) { setStatus(msg); setLoading(false); })
+          .withFailureHandler(function(err) { setStatus("Error: " + err.message); setLoading(false); })
+          .applySnowballFilter(groups, direction);
+      }
+
+      function setStatus(msg) {
+        document.getElementById('status').innerText = msg;
+      }
+
+      function setLoading(loading) {
+        ['seedBtn','expandBtn','filterBtn','addGroupBtn'].forEach(function(id) {
+          document.getElementById(id).disabled = loading;
+        });
+      }
+
+      function start() {
+        var input     = document.getElementById('seedInput').value.trim();
+        var direction = document.querySelector('input[name="direction"]:checked').value;
+        if (!input) { setStatus("Please enter a DOI or OpenAlex ID."); return; }
+        setLoading(true);
+        setStatus("Searching OpenAlex...");
+        google.script.run
+          .withSuccessHandler(function(msg) { setStatus(msg); setLoading(false); })
+          .withFailureHandler(function(err) { setStatus("Error: " + err.message); setLoading(false); })
+          .startSnowball(input, direction);
       }
 
       function expand() {
-        updateStatus("Expanding graph... this may take a moment.");
+        var direction = document.querySelector('input[name="direction"]:checked').value;
+        setLoading(true);
+        setStatus("Fetching " + (direction === "backward" ? "references (backward)" : "citing papers (forward)") + "... this may take a moment.");
         google.script.run
-          .withSuccessHandler(s => updateStatus(s))
-          .expandSnowball();
+          .withSuccessHandler(function(msg) { setStatus(msg); setLoading(false); })
+          .withFailureHandler(function(err) { setStatus("Error: " + err.message); setLoading(false); })
+          .expandSnowball(direction);
       }
 
-      function updateStatus(msg) {
-        document.getElementById('status').innerText = msg;
-      }
+      // Restore last saved filter on load, or start with two blank groups
+      google.script.run
+        .withSuccessHandler(function(groups) {
+          if (groups && groups.length > 0) {
+            groups.forEach(function(g) { addGroup(g); });
+          } else {
+            addGroup();
+            addGroup();
+          }
+        })
+        .withFailureHandler(function() { addGroup(); addGroup(); })
+        .getLastSnowballFilter();
     </script>
   </body>
 </html>

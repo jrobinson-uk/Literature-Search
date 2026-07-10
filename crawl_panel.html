@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        font-family: 'Segoe UI', sans-serif; padding: 14px;
+        background: #f9f9f9; font-size: 13px; color: #333; margin: 0;
+      }
+      p.hint { font-size: 11px; color: #777; margin: 0 0 8px 0; }
+
+      input[type="text"], input[type="number"] {
+        width: 100%; padding: 7px 9px;
+        border: 1px solid #ccc; border-radius: 4px;
+        font-size: 12px; margin-bottom: 8px;
+      }
+      input[type="text"]:focus, input[type="number"]:focus {
+        border-color: #1a73e8; outline: none;
+      }
+
+      button {
+        width: 100%; padding: 9px; border: none; border-radius: 4px;
+        cursor: pointer; font-weight: bold; font-size: 13px;
+        margin-bottom: 8px; transition: background 0.15s, opacity 0.15s;
+      }
+      button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+      #findBtn         { background: #1a73e8; color: white; }
+      #findBtn:hover:not(:disabled) { background: #1765cc; }
+      #addSeedBtn, #addAllSeedsBtn { background: #34a853; color: white; margin-top: 6px; }
+      #addSeedBtn:hover:not(:disabled),
+      #addAllSeedsBtn:hover:not(:disabled) { background: #2d8e47; }
+      #crawlStartBtn   { background: #34a853; color: white; }
+      #crawlStartBtn:hover:not(:disabled) { background: #2d8e47; }
+      #crawlResumeBtn  { background: #f4b400; color: #333; }
+      #crawlResumeBtn:hover:not(:disabled) { background: #d9a200; }
+      #filterBtn       { background: #f4b400; color: #333; }
+      #filterBtn:hover:not(:disabled) { background: #d9a200; }
+      #addGroupBtn {
+        background: white; color: #1a73e8;
+        border: 1px dashed #1a73e8; font-weight: normal;
+        padding: 6px; margin-bottom: 6px;
+      }
+      #addGroupBtn:hover:not(:disabled) { background: #e8f0fe; }
+
+      /* ── Collapsible sections ── */
+      .section { margin-bottom: 10px; }
+
+      .section-header {
+        display: flex; align-items: center; justify-content: space-between;
+        font-weight: bold; font-size: 13px; color: #1a73e8;
+        padding: 6px 0; border-bottom: 2px solid #e8f0fe;
+        margin-bottom: 10px; user-select: none;
+      }
+      .section-header.locked  { color: #bbb; border-color: #eee; cursor: default; }
+      .section-header.toggle  { cursor: pointer; }
+      .section-header.toggle:hover { color: #1557b0; }
+
+      .chevron {
+        font-size: 9px; display: inline-block;
+        transition: transform 0.2s; color: #aaa;
+      }
+      .section-header.open .chevron { transform: rotate(90deg); }
+      .section-header.locked .chevron { display: none; }
+
+      .section-body {
+        overflow: hidden;
+        max-height: 1200px;
+        transition: max-height 0.3s ease, opacity 0.25s ease;
+        opacity: 1;
+      }
+      .section-body.collapsed { max-height: 0; opacity: 0; }
+
+      /* ── Steps ── */
+      #steps { margin: 8px 0 4px 0; }
+      .step {
+        display: flex; align-items: flex-start; gap: 7px;
+        font-size: 11px; color: #444; padding: 2px 0;
+      }
+      .step-icon { flex-shrink: 0; font-size: 12px; line-height: 1.4; }
+      .step-ok   .step-icon { color: #34a853; }
+      .step-fail .step-icon { color: #e53935; }
+      .step-info .step-icon { color: #aaa; }
+
+      /* ── Paper card ── */
+      .paper-card {
+        background: #e8f0fe; border: 1px solid #c5d8f6; border-radius: 6px;
+        padding: 10px 12px; margin: 8px 0 0 0;
+      }
+      .paper-card-title { font-weight: bold; font-size: 12px; color: #1a73e8; margin-bottom: 4px; }
+      .paper-card-meta  { font-size: 11px; color: #555; line-height: 1.5; }
+      .paper-card-count { font-size: 11px; color: #888; margin-top: 3px; }
+
+      /* ── Seeds list ── */
+      #seedsList { margin-top: 4px; }
+      .seeds-list-header {
+        font-size: 11px; font-weight: bold; color: #555;
+        margin: 10px 0 4px 0;
+      }
+      .seed-row {
+        display: flex; align-items: flex-start; gap: 6px;
+        padding: 5px 0; border-bottom: 1px solid #e8e8e8;
+      }
+      .seed-row:last-child { border-bottom: none; }
+      .seed-info { flex: 1; font-size: 11px; color: #333; }
+      .seed-info strong { display: block; margin-bottom: 1px; }
+      .seed-meta { color: #777; }
+
+      /* ── Backward pass options ── */
+      .back-options { margin-bottom: 10px; }
+      .check-row {
+        display: flex; align-items: flex-start; gap: 8px;
+        font-size: 12px; color: #333; padding: 3px 0;
+      }
+      .check-row input[type="checkbox"] { margin-top: 2px; flex-shrink: 0; width: auto; }
+      .check-row label { cursor: pointer; }
+      .check-sub { padding-left: 20px; }
+      .check-sub .check-row { color: #555; font-size: 11px; }
+
+      /* ── Filter cards ── */
+      .group-card {
+        background: white; border: 1px solid #ddd; border-radius: 6px;
+        padding: 8px 10px; margin-bottom: 6px;
+      }
+      .group-header { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+      .group-label  { font-weight: bold; font-size: 11px; color: #555; flex: 1; }
+      .and-divider  {
+        text-align: center; font-size: 10px; font-weight: bold;
+        color: #aaa; margin: 2px 0 6px 0; letter-spacing: 1px;
+      }
+      .not-label  { font-size: 11px; display: flex; align-items: center; gap: 3px; white-space: nowrap; }
+      .remove-btn {
+        background: none; border: none; color: #e53935;
+        cursor: pointer; font-size: 16px; padding: 0;
+        width: auto; margin: 0; line-height: 1;
+      }
+      .terms-input {
+        width: 100%; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px;
+        font-size: 12px; font-family: monospace; margin: 0;
+      }
+      .terms-input:focus { border-color: #1a73e8; outline: none; }
+
+      .limits-row { display: flex; gap: 8px; margin-bottom: 8px; }
+      .limits-row > div { flex: 1; }
+      .limits-row label { display: block; font-size: 11px; color: #555; margin-bottom: 3px; }
+      .limits-row input[type="number"] { margin-bottom: 0; }
+
+      /* ── Resume-code paste bar ── */
+      .resume-bar { display: flex; gap: 5px; margin-bottom: 10px; }
+      .resume-bar input {
+        flex: 1; margin-bottom: 0; font-size: 11px;
+        font-family: monospace; color: #555;
+      }
+      .resume-bar button {
+        width: auto; flex-shrink: 0; padding: 6px 10px; margin-bottom: 0;
+        background: #e8f0fe; color: #1a73e8;
+        border: 1px solid #c5d8f6; font-weight: normal; font-size: 11px;
+      }
+      .resume-bar button:hover { background: #d2e3fc; }
+
+      hr { border: 0; border-top: 1px solid #e0e0e0; margin: 12px 0; }
+
+      #status {
+        font-size: 12px; color: #444; font-style: italic;
+        background: #fff; border: 1px solid #e0e0e0;
+        border-radius: 4px; padding: 8px 10px; min-height: 36px;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+
+    <!-- ── Resume code paste bar ── -->
+    <div class="resume-bar">
+      <input type="text" id="resumeCodeInput" placeholder="Paste resume code from log sheet…">
+      <button onclick="loadFromCode()">Load</button>
+    </div>
+
+    <!-- ── Section 1: Find Paper (always open) ── -->
+    <div class="section">
+      <div class="section-header">1. Find Seed Papers</div>
+      <div class="section-body" id="findBody">
+        <p class="hint">
+          Enter a title, DOI, OpenAlex ID (W...), ArXiv ID, or Semantic Scholar URL / ID.
+          To add multiple papers at once, paste a <strong>comma-separated list of IDs</strong>.
+        </p>
+        <input type="text" id="searchInput"
+               placeholder="W2767527961, 10.1145/3137065.3137083, 2301.00001  — or a paper title">
+        <button id="findBtn" onclick="findPaper()">Find Paper</button>
+        <div id="steps"></div>
+        <div id="paperCard" class="paper-card" style="display:none">
+          <div class="paper-card-title" id="paperTitle"></div>
+          <div class="paper-card-meta"  id="paperMeta"></div>
+          <div class="paper-card-count" id="paperCount"></div>
+        </div>
+        <button id="addSeedBtn"     onclick="addSeed()"      style="display:none">+ Add as Seed</button>
+        <button id="addAllSeedsBtn" onclick="addAllPapers()" style="display:none">+ Add found papers as seeds</button>
+        <div id="seedsList"></div>
+      </div>
+    </div>
+
+    <!-- ── Section 2: Crawl Settings (locked until first seed added) ── -->
+    <div class="section">
+      <div class="section-header locked" id="settingsHeader"
+           onclick="toggleSection('settingsBody','settingsHeader')">
+        2. Crawl Settings <span class="chevron">▶</span>
+      </div>
+      <div class="section-body collapsed" id="settingsBody">
+        <p class="hint">Name this crawl — it becomes the sheet tab name.</p>
+        <input type="text" id="crawlName" placeholder="e.g. K12 Physical Computing 2024">
+        <div class="limits-row">
+          <div>
+            <label>Max depth</label>
+            <input type="number" id="crawlMaxDepth" value="2" min="1" max="5">
+          </div>
+          <div>
+            <label>Max papers</label>
+            <input type="number" id="crawlMaxPapers" value="300" min="1" max="2000">
+          </div>
+        </div>
+        <div class="back-options">
+          <div class="check-row">
+            <input type="checkbox" id="runBackwardCheck" onchange="toggleExpandOption()">
+            <label for="runBackwardCheck">Run backward pass after forward crawl</label>
+          </div>
+          <div class="check-sub" id="expandBackwardRow" style="display:none">
+            <div class="check-row">
+              <input type="checkbox" id="expandBackwardCheck">
+              <label for="expandBackwardCheck">Expand backward papers (forward crawl on discovered papers)</label>
+            </div>
+          </div>
+        </div>
+        <button id="crawlStartBtn" onclick="startCrawl()" disabled>Start Crawl</button>
+        <button id="crawlResumeBtn" onclick="resumeCrawl()">Resume Last Crawl</button>
+      </div>
+    </div>
+
+    <!-- ── Section 3: Filter (locked until first seed added) ── -->
+    <div class="section">
+      <div class="section-header locked" id="filterHeader"
+           onclick="toggleSection('filterBody','filterHeader')">
+        3. Filter <span class="chevron">▶</span>
+      </div>
+      <div class="section-body collapsed" id="filterBody">
+        <p class="hint">
+          Only papers whose abstracts match this filter are added to the sheet.
+          Each card is an <strong>AND</strong> condition; terms within a card are <strong>OR</strong>'d.
+          Tick <strong>NOT</strong> to exclude matches.
+        </p>
+        <div id="groupsContainer"></div>
+        <button id="addGroupBtn" onclick="addGroup()">+ Add AND Group</button>
+        <button id="filterBtn"   onclick="applyFilter()">Apply Highlight Rule</button>
+      </div>
+    </div>
+
+    <hr>
+    <div id="status">Ready.</div>
+
+    <script>
+      var groupCount    = 0;
+      var seeds         = [];    // full S2 paper objects committed to the crawl
+      var currentPaper  = null;  // single paper just found, not yet added
+      var pendingBatch  = [];    // papers found in a bulk search, not yet added
+
+
+
+      // ── Section toggling ──────────────────────────────────────
+      function toggleSection(bodyId, headerId) {
+        var header = document.getElementById(headerId);
+        if (header.classList.contains('locked')) return;
+        var body   = document.getElementById(bodyId);
+        var nowOpen = body.classList.contains('collapsed');
+        body.classList.toggle('collapsed', !nowOpen);
+        header.classList.toggle('open', nowOpen);
+      }
+
+      function unlockSections() {
+        ['settingsHeader','filterHeader'].forEach(function(id) {
+          var h = document.getElementById(id);
+          h.classList.remove('locked');
+          h.classList.add('toggle', 'open');
+        });
+        document.getElementById('settingsBody').classList.remove('collapsed');
+        document.getElementById('filterBody').classList.remove('collapsed');
+        document.getElementById('crawlStartBtn').disabled = false;
+      }
+
+      function lockSections() {
+        ['settingsHeader','filterHeader'].forEach(function(id) {
+          var h = document.getElementById(id);
+          h.classList.add('locked');
+          h.classList.remove('toggle', 'open');
+        });
+        document.getElementById('settingsBody').classList.add('collapsed');
+        document.getElementById('filterBody').classList.add('collapsed');
+        document.getElementById('crawlStartBtn').disabled = true;
+      }
+
+      // ── Step rendering ────────────────────────────────────────
+      function renderSteps(steps) {
+        var container = document.getElementById('steps');
+        container.innerHTML = '';
+        (steps || []).forEach(function(s) {
+          var icon = s.ok === true ? '✓' : s.ok === false ? '✗' : '→';
+          var cls  = s.ok === true ? 'step-ok' : s.ok === false ? 'step-fail' : 'step-info';
+          var div  = document.createElement('div');
+          div.className = 'step ' + cls;
+          div.innerHTML =
+            '<span class="step-icon">' + icon + '</span>' +
+            '<span>' + escHtml(s.text) + '</span>';
+          container.appendChild(div);
+        });
+      }
+
+      function escHtml(str) {
+        return String(str)
+          .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+          .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+      }
+
+      // ── Paper card ────────────────────────────────────────────
+      function showPaperCard(paper) {
+        var authors = (paper.authors || []).slice(0, 3).map(function(a) { return a.name; }).join(', ');
+        if ((paper.authors || []).length > 3) authors += ' et al.';
+        document.getElementById('paperTitle').textContent = paper.title || '(No title)';
+        document.getElementById('paperMeta').textContent =
+          [paper.year, authors, paper.venue].filter(Boolean).join(' · ');
+        document.getElementById('paperCount').textContent =
+          paper.citationCount != null ? paper.citationCount.toLocaleString() + ' citations' : '';
+        document.getElementById('paperCard').style.display = 'block';
+        document.getElementById('addSeedBtn').style.display = 'block';
+      }
+
+      function hidePaperCard() {
+        document.getElementById('paperCard').style.display     = 'none';
+        document.getElementById('addSeedBtn').style.display    = 'none';
+        document.getElementById('addAllSeedsBtn').style.display = 'none';
+      }
+
+      // ── Seeds list ────────────────────────────────────────────
+      function addSeed() {
+        if (!currentPaper) return;
+
+        // Prevent duplicates
+        var alreadyAdded = seeds.some(function(s) { return s.paperId === currentPaper.paperId; });
+        if (alreadyAdded) {
+          setStatus('This paper is already in your seeds list.');
+          return;
+        }
+
+        seeds.push(currentPaper);
+        renderSeedsList();
+
+        if (seeds.length === 1) {
+          unlockSections();
+          // Auto-fill crawl name from first seed title if still empty
+          var nameEl = document.getElementById('crawlName');
+          if (!nameEl.value && currentPaper.title) {
+            nameEl.value = currentPaper.title.slice(0, 60);
+          }
+        }
+
+        hidePaperCard();
+        document.getElementById('steps').innerHTML = '';
+        currentPaper = null;
+        document.getElementById('searchInput').value = '';
+        document.getElementById('searchInput').focus();
+
+        setStatus(seeds.length === 1
+          ? 'Seed added. Add more papers or configure the crawl below.'
+          : seeds.length + ' seeds added. Add more or start the crawl.');
+      }
+
+      function removeSeed(i) {
+        seeds.splice(i, 1);
+        renderSeedsList();
+        if (seeds.length === 0) {
+          lockSections();
+          document.getElementById('crawlName').value = '';
+          setStatus('All seeds removed. Find a paper to begin.');
+        } else {
+          setStatus(seeds.length + ' seed' + (seeds.length === 1 ? '' : 's') + ' remaining.');
+        }
+      }
+
+      function renderSeedsList() {
+        var container = document.getElementById('seedsList');
+        container.innerHTML = '';
+        if (seeds.length === 0) return;
+
+        var header = document.createElement('p');
+        header.className = 'seeds-list-header';
+        header.textContent = 'Seed Papers (' + seeds.length + ')';
+        container.appendChild(header);
+
+        seeds.forEach(function(paper, i) {
+          var row = document.createElement('div');
+          row.className = 'seed-row';
+
+          var info = document.createElement('div');
+          info.className = 'seed-info';
+          var title = (paper.title || '(No title)');
+          if (title.length > 72) title = title.slice(0, 72) + '…';
+          var authorNames = (paper.authors || []).slice(0, 2).map(function(a) { return a.name; }).join(', ');
+          var meta = [paper.year, authorNames].filter(Boolean).join(' · ');
+          info.innerHTML =
+            '<strong>' + escHtml(title) + '</strong>' +
+            (meta ? '<span class="seed-meta">' + escHtml(meta) + '</span>' : '');
+
+          var btn = document.createElement('button');
+          btn.className = 'remove-btn';
+          btn.title = 'Remove';
+          btn.innerHTML = '&#215;';
+          btn.setAttribute('data-idx', i);
+          btn.onclick = function() { removeSeed(parseInt(this.getAttribute('data-idx'))); };
+
+          row.appendChild(info);
+          row.appendChild(btn);
+          container.appendChild(row);
+        });
+      }
+
+      // ── Find paper ────────────────────────────────────────────
+      function findPaper() {
+        var raw = document.getElementById('searchInput').value.trim();
+        if (!raw) { setStatus('Please enter a title, DOI, or ID.'); return; }
+
+        document.getElementById('steps').innerHTML = '';
+        hidePaperCard();
+        currentPaper = null;
+        pendingBatch = [];
+        setFindLoading(true);
+        setStatus('Searching…');
+
+        // Comma-separated list → bulk resolve
+        var parts = raw.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+        if (parts.length > 1) {
+          setStatus('Resolving ' + parts.length + ' papers…');
+          google.script.run
+            .withSuccessHandler(function(results) {
+              handleMultipleResults(results);
+              setFindLoading(false);
+            })
+            .withFailureHandler(function(err) {
+              setStatus('Error: ' + err.message);
+              setFindLoading(false);
+            })
+            .findMultipleSeedPapers(parts);
+          return;
+        }
+
+        // Single input → existing step-by-step flow
+        google.script.run
+          .withSuccessHandler(function(result) {
+            renderSteps(result.steps);
+            if (result.paper) {
+              currentPaper = result.paper;
+              showPaperCard(result.paper);
+              setStatus('Paper found. Click "+ Add as Seed" to add it.');
+            } else {
+              setStatus(result.error || 'Paper not found.');
+            }
+            setFindLoading(false);
+          })
+          .withFailureHandler(function(err) {
+            setStatus('Error: ' + err.message);
+            setFindLoading(false);
+          })
+          .findSeedPaper(raw);
+      }
+
+      // ── Bulk results (comma-separated input) ──────────────────
+      function handleMultipleResults(results) {
+        var container = document.getElementById('steps');
+        container.innerHTML = '';
+        pendingBatch = [];
+
+        results.forEach(function(r) {
+          var label = r.input.length > 35 ? r.input.slice(0, 35) + '…' : r.input;
+          var div   = document.createElement('div');
+          var ok    = !!r.paper;
+          div.className = 'step ' + (ok ? 'step-ok' : 'step-fail');
+          var detail = ok
+            ? escHtml((r.paper.title || '').slice(0, 55)) + ((r.paper.title || '').length > 55 ? '…' : '')
+            : escHtml(r.error || 'Not found');
+          div.innerHTML =
+            '<span class="step-icon">' + (ok ? '✓' : '✗') + '</span>' +
+            '<span><strong>' + escHtml(label) + '</strong> → ' + detail + '</span>';
+          container.appendChild(div);
+          if (ok) pendingBatch.push(r.paper);
+        });
+
+        var found  = pendingBatch.length;
+        var total  = results.length;
+        if (found > 0) {
+          var btn = document.getElementById('addAllSeedsBtn');
+          btn.textContent = '+ Add ' + found + ' of ' + total + ' paper' +
+                            (found === 1 ? '' : 's') + ' as seeds';
+          btn.style.display = 'block';
+          setStatus(found + ' of ' + total + ' papers found. Click the button to add them.');
+        } else {
+          setStatus('No papers found. Check the IDs and try again.');
+        }
+      }
+
+      // Adds every paper in pendingBatch to the seeds list (deduped)
+      function addAllPapers() {
+        var added = 0;
+        pendingBatch.forEach(function(paper) {
+          if (!seeds.some(function(s) { return s.paperId === paper.paperId; })) {
+            seeds.push(paper);
+            added++;
+          }
+        });
+        var firstAdd = (seeds.length === added); // true if seeds was empty before
+        renderSeedsList();
+
+        if (added > 0 && firstAdd) {
+          unlockSections();
+          var nameEl = document.getElementById('crawlName');
+          if (!nameEl.value && pendingBatch[0] && pendingBatch[0].title) {
+            nameEl.value = pendingBatch[0].title.slice(0, 60);
+          }
+        }
+
+        document.getElementById('addAllSeedsBtn').style.display = 'none';
+        document.getElementById('steps').innerHTML = '';
+        pendingBatch = [];
+        document.getElementById('searchInput').value = '';
+        document.getElementById('searchInput').focus();
+        setStatus(added + ' paper' + (added === 1 ? '' : 's') + ' added. ' +
+                  seeds.length + ' total seed' + (seeds.length === 1 ? '' : 's') + '.');
+      }
+
+      // ── Backward pass toggle ──────────────────────────────────
+      function toggleExpandOption() {
+        var show = document.getElementById('runBackwardCheck').checked;
+        document.getElementById('expandBackwardRow').style.display = show ? 'block' : 'none';
+        if (!show) document.getElementById('expandBackwardCheck').checked = false;
+      }
+
+      // ── Start / Resume ────────────────────────────────────────
+      function startCrawl() {
+        if (!seeds.length) { setStatus('Please add at least one seed paper.'); return; }
+        var crawlName      = document.getElementById('crawlName').value.trim();
+        var maxDepth       = parseInt(document.getElementById('crawlMaxDepth').value)  || 2;
+        var maxPapers      = parseInt(document.getElementById('crawlMaxPapers').value) || 300;
+        var groups         = getGroupsFromPanel();
+        var runBackward    = document.getElementById('runBackwardCheck').checked;
+        var expandBackward = document.getElementById('expandBackwardCheck').checked;
+
+        if (!crawlName)          { setStatus('Please enter a name for this crawl.'); return; }
+        if (groups.length === 0) { setStatus('Please add at least one filter group.'); return; }
+
+        setLoading(true);
+        setStatus('Starting crawl — running in background. Watch the Crawl Status cell on the sheet.');
+        google.script.run
+          .withSuccessHandler(function(msg) { setStatus(msg); setLoading(false); })
+          .withFailureHandler(function(err) { setStatus('Error: ' + err.message); setLoading(false); })
+          .startCrawl(seeds, 'forward', maxDepth, maxPapers, groups, crawlName,
+                      { runBackward: runBackward, expandBackward: expandBackward });
+      }
+
+      function resumeCrawl() {
+        setLoading(true);
+        setStatus('Resuming crawl…');
+        google.script.run
+          .withSuccessHandler(function(msg) { setStatus(msg); setLoading(false); })
+          .withFailureHandler(function(err) { setStatus('Error: ' + err.message); setLoading(false); })
+          .resumeCrawl();
+      }
+
+      // ── Filter ────────────────────────────────────────────────
+      function applyFilter() {
+        var groups = getGroupsFromPanel();
+        if (groups.length === 0) { setStatus('Please add at least one group with terms.'); return; }
+        setLoading(true);
+        setStatus('Applying highlight rule…');
+        google.script.run
+          .withSuccessHandler(function(msg) { setStatus(msg); setLoading(false); })
+          .withFailureHandler(function(err) { setStatus('Error: ' + err.message); setLoading(false); })
+          .applyCrawlFilter(groups);
+      }
+
+      function addGroup(data) {
+        groupCount++;
+        var container = document.getElementById('groupsContainer');
+        if (container.children.length > 0) {
+          var divider = document.createElement('div');
+          divider.className = 'and-divider';
+          divider.innerText = '— AND —';
+          container.appendChild(divider);
+        }
+        var id   = 'group-' + groupCount;
+        var card = document.createElement('div');
+        card.className = 'group-card';
+        card.id = id;
+        card.innerHTML =
+          '<div class="group-header">' +
+            '<span class="group-label">Group ' + groupCount + '</span>' +
+            '<label class="not-label"><input type="checkbox" class="notCheck"> NOT</label>' +
+            '<button class="remove-btn" onclick="removeGroup(\'' + id + '\')" title="Remove">&#215;</button>' +
+          '</div>' +
+          '<input type="text" class="terms-input" placeholder=\'term A, "exact phrase", term C\'>';
+        container.appendChild(card);
+        if (data) {
+          card.querySelector('.terms-input').value = data.terms || '';
+          card.querySelector('.notCheck').checked  = !!data.not;
+        }
+      }
+
+      function removeGroup(id) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        var prev = el.previousElementSibling;
+        if (prev && prev.classList.contains('and-divider')) {
+          prev.remove();
+        } else {
+          var next = el.nextElementSibling;
+          if (next && next.classList.contains('and-divider')) next.remove();
+        }
+        el.remove();
+      }
+
+      function getGroupsFromPanel() {
+        var groups = [];
+        document.querySelectorAll('.group-card').forEach(function(card) {
+          var terms = card.querySelector('.terms-input').value.trim();
+          var not   = card.querySelector('.notCheck').checked;
+          if (terms) groups.push({ terms: terms, not: not });
+        });
+        return groups;
+      }
+
+      // ── Utilities ─────────────────────────────────────────────
+      function setStatus(msg) {
+        document.getElementById('status').textContent = msg;
+      }
+
+      function setFindLoading(loading) {
+        var btn = document.getElementById('findBtn');
+        btn.disabled    = loading;
+        btn.textContent = loading ? 'Searching…' : 'Find Paper';
+      }
+
+      function setLoading(loading) {
+        ['findBtn','crawlStartBtn','crawlResumeBtn','filterBtn','addGroupBtn'].forEach(function(id) {
+          var el = document.getElementById(id);
+          if (el) el.disabled = loading;
+        });
+      }
+
+      // ── On load: restore filter groups, then check for log replay ──
+      google.script.run
+        .withSuccessHandler(function(groups) {
+          if (groups && groups.length > 0) {
+            groups.forEach(function(g) { addGroup(g); });
+          } else {
+            addGroup(); addGroup();
+          }
+          // After groups are ready, check for a pending log replay
+          google.script.run
+            .withSuccessHandler(function(replay) { if (replay) applyReplay(replay); })
+            .withFailureHandler(function() {})
+            .getLogReplay();
+        })
+        .withFailureHandler(function() {
+          addGroup(); addGroup();
+        })
+        .getLastSnowballFilter();
+
+      // ── Resume code paste bar ────────────────────────────────
+      function loadFromCode() {
+        var raw = document.getElementById('resumeCodeInput').value.trim();
+        if (!raw) { setStatus('Paste a resume code from the log sheet first.'); return; }
+        var replay;
+        try { replay = JSON.parse(raw); }
+        catch (e) {
+          setStatus('Invalid resume code — copy the full JSON text from the "Resume Code" column in the log sheet and paste it here.');
+          return;
+        }
+        if (!replay || !replay.type) {
+          setStatus('Unrecognised resume code format.');
+          return;
+        }
+        if (replay.type !== 'Crawl') {
+          setStatus('This code is for a ' + replay.type + ' search — open the ' + replay.type + ' panel to load it.');
+          return;
+        }
+        document.getElementById('resumeCodeInput').value = '';
+        applyReplay(replay);
+      }
+
+      // ── Log replay ────────────────────────────────────────────
+      function applyReplay(replay) {
+        // Pre-fill crawl name
+        var nameEl = document.getElementById('crawlName');
+        if (replay.name) nameEl.value = replay.name;
+
+        // Pre-fill depth and max papers
+        if (replay.depth)     document.getElementById('crawlMaxDepth').value  = replay.depth;
+        if (replay.maxPapers) document.getElementById('crawlMaxPapers').value = replay.maxPapers;
+
+        // Pre-fill backward pass checkboxes
+        var hasBackward = replay.backwardPass && replay.backwardPass !== 'None';
+        if (hasBackward) {
+          document.getElementById('runBackwardCheck').checked = true;
+          toggleExpandOption();
+          if (replay.backwardPass === 'Backward + Expand') {
+            document.getElementById('expandBackwardCheck').checked = true;
+          }
+        }
+
+        // Replace filter groups with logged ones
+        if (replay.filterGroups && replay.filterGroups.length > 0) {
+          document.getElementById('groupsContainer').innerHTML = '';
+          groupCount = 0;
+          replay.filterGroups.forEach(function(g) { addGroup(g); });
+        }
+
+        // Pre-fill seed IDs into the search input (pipe-sep → comma-sep)
+        if (replay.seedsStr) {
+          document.getElementById('searchInput').value =
+            replay.seedsStr.replace(/ \| /g, ', ');
+        }
+
+        // Show appropriate status message
+        if (replay.canResume) {
+          setStatus(
+            'Replay loaded from log.\n\n' +
+            'RESUME: Click "Resume Last Crawl" to continue the existing crawl sheet.\n\n' +
+            'FRESH RUN: Find seeds below and click "Start Crawl" for a new sheet ' +
+            'with the same settings.'
+          );
+        } else {
+          setStatus(
+            'Replay loaded from log — settings pre-filled.\n\n' +
+            'Click "Find Paper" to resolve the seeds, then "Start Crawl" to begin a fresh run.'
+          );
+        }
+      }
+    </script>
+  </body>
+</html>

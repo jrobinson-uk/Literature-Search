@@ -1,0 +1,4 @@
+# Exclude Claude Code internal directories.
+# skipSubdirectories:true in .clasp.json already handles this,
+# but belt-and-braces in case clasp version behaviour changes.
+.claude/

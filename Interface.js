@@ -1,4 +1,5 @@
 const debugMode = true;
+const VERSION = "1.11.6";
 
 /**
  * Runs automatically when the sheet is opened.
@@ -9,9 +10,16 @@ function onOpen() {
   ui.createMenu('Scholar Tool')
     .addItem('Open Search Panel', 'showSidebar')
     .addSeparator()
-      .addItem('Start Snowball', 'showSnowballbar')
+    .addItem('Snowball Search', 'showSnowballbar')
+    .addItem('Citation Crawl', 'showCrawlbar')
     .addSeparator()
-    .addItem('Set API Key', 'promptForKey')
+    .addItem('Load Selected Log Row', 'resumeFromLog')
+    .addSeparator()
+    .addItem('Set SerpAPI Key', 'promptForKey')
+    .addItem('Set OpenAlex Email', 'promptForOpenAlexEmail')
+    .addItem('Set Semantic Scholar API Key', 'promptForS2ApiKey')
+    .addSeparator()
+    .addItem('Version ' + VERSION, 'showVersion')
     .addToUi();
     
   // Note: Auto-opening sidebars only works after the user has 
@@ -34,11 +42,52 @@ function showSnowballbar() {
     .setWidth(300);
   SpreadsheetApp.getUi().showSidebar(html);
 }
+function showCrawlbar() {
+  const html = HtmlService.createHtmlOutputFromFile('crawl_panel')
+    .setTitle('Citation Crawl')
+    .setWidth(300);
+  SpreadsheetApp.getUi().showSidebar(html);
+}
+
 function promptForKey() {
   const ui = SpreadsheetApp.getUi();
-  const response = ui.prompt("Set API Key", "Paste your SerpApi Key here:", ui.ButtonSet.OK_CANCEL);
+  const response = ui.prompt("Set SerpAPI Key", "Paste your SerpApi Key here:", ui.ButtonSet.OK_CANCEL);
   if (response.getSelectedButton() == ui.Button.OK) {
     PropertiesService.getScriptProperties().setProperty('SERPAPI_KEY', response.getResponseText());
     ui.alert("API Key saved successfully!");
+  }
+}
+
+function showVersion() {
+  SpreadsheetApp.getUi().alert('Scholar Tool — Version ' + VERSION);
+}
+
+function promptForOpenAlexEmail() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.prompt("Set OpenAlex Email", "Enter your email address for the OpenAlex polite pool (free access):", ui.ButtonSet.OK_CANCEL);
+  if (response.getSelectedButton() == ui.Button.OK) {
+    PropertiesService.getScriptProperties().setProperty('OPENALEX_EMAIL', response.getResponseText().trim());
+    ui.alert("OpenAlex email saved successfully!");
+  }
+}
+
+function promptForS2ApiKey() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.prompt(
+    "Set Semantic Scholar API Key",
+    "Paste your Semantic Scholar API key here.\n\n" +
+    "Apply at: https://www.semanticscholar.org/product/api#api-key\n\n" +
+    "Leave blank and click OK to clear a previously saved key.",
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (response.getSelectedButton() == ui.Button.OK) {
+    const key = response.getResponseText().trim();
+    if (key) {
+      PropertiesService.getScriptProperties().setProperty('S2_API_KEY', key);
+      ui.alert("Semantic Scholar API key saved successfully!");
+    } else {
+      PropertiesService.getScriptProperties().deleteProperty('S2_API_KEY');
+      ui.alert("Semantic Scholar API key cleared.");
+    }
   }
 }

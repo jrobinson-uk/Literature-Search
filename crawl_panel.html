@@ -33,6 +33,7 @@
       #addAllSeedsBtn:hover:not(:disabled) { background: #2d8e47; }
       #crawlStartBtn   { background: #34a853; color: white; }
       #crawlStartBtn:hover:not(:disabled) { background: #2d8e47; }
+      #crawlStartBtn:disabled { background: #ccc; color: #888; opacity: 1; }
       #crawlResumeBtn  { background: #f4b400; color: #333; }
       #crawlResumeBtn:hover:not(:disabled) { background: #d9a200; }
       #filterBtn       { background: #f4b400; color: #333; }
@@ -53,7 +54,6 @@
         padding: 6px 0; border-bottom: 2px solid #e8f0fe;
         margin-bottom: 10px; user-select: none;
       }
-      .section-header.locked  { color: #bbb; border-color: #eee; cursor: default; }
       .section-header.toggle  { cursor: pointer; }
       .section-header.toggle:hover { color: #1557b0; }
 
@@ -62,7 +62,6 @@
         transition: transform 0.2s; color: #aaa;
       }
       .section-header.open .chevron { transform: rotate(90deg); }
-      .section-header.locked .chevron { display: none; }
 
       .section-body {
         overflow: hidden;
@@ -82,6 +81,15 @@
       .step-ok   .step-icon { color: #34a853; }
       .step-fail .step-icon { color: #e53935; }
       .step-info .step-icon { color: #aaa; }
+      .step-text { flex: 1; }
+
+      .step-retry-btn {
+        width: auto; flex-shrink: 0; margin: 0 0 0 auto; padding: 2px 8px;
+        font-size: 10px; font-weight: normal; border-radius: 3px;
+        background: #fff3e0; color: #e65100; border: 1px solid #ffcc80;
+      }
+      .step-retry-btn:hover:not(:disabled) { background: #ffe0b2; }
+      .step-retry-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
       /* ── Paper card ── */
       .paper-card {
@@ -200,13 +208,13 @@
       </div>
     </div>
 
-    <!-- ── Section 2: Crawl Settings (locked until first seed added) ── -->
+    <!-- ── Section 2: Crawl Settings ── -->
     <div class="section">
-      <div class="section-header locked" id="settingsHeader"
+      <div class="section-header toggle open" id="settingsHeader"
            onclick="toggleSection('settingsBody','settingsHeader')">
         2. Crawl Settings <span class="chevron">▶</span>
       </div>
-      <div class="section-body collapsed" id="settingsBody">
+      <div class="section-body" id="settingsBody">
         <p class="hint">Name this crawl — it becomes the sheet tab name.</p>
         <input type="text" id="crawlName" placeholder="e.g. K12 Physical Computing 2024">
         <div class="limits-row">
@@ -240,18 +248,17 @@
           rejects, marked as already-crawled so they aren't expanded further — useful for auditing
           why a paper didn't make it in. Costs no extra API calls, just extra rows.
         </p>
-        <button id="crawlStartBtn" onclick="startCrawl()" disabled>Start Crawl</button>
         <button id="crawlResumeBtn" onclick="resumeCrawl()">Resume Last Crawl</button>
       </div>
     </div>
 
-    <!-- ── Section 3: Filter (locked until first seed added) ── -->
+    <!-- ── Section 3: Filter ── -->
     <div class="section">
-      <div class="section-header locked" id="filterHeader"
+      <div class="section-header toggle open" id="filterHeader"
            onclick="toggleSection('filterBody','filterHeader')">
         3. Filter <span class="chevron">▶</span>
       </div>
-      <div class="section-body collapsed" id="filterBody">
+      <div class="section-body" id="filterBody">
         <p class="hint">
           Only papers whose abstracts match this filter are added to the sheet.
           Each card is an <strong>AND</strong> condition; terms within a card are <strong>OR</strong>'d.
@@ -262,6 +269,9 @@
         <button id="filterBtn"   onclick="applyFilter()">Apply Highlight Rule</button>
       </div>
     </div>
+
+    <!-- ── Start Crawl: always last — after seeds, settings, and filters ── -->
+    <button id="crawlStartBtn" onclick="startCrawl()" disabled>Start Crawl</button>
 
     <hr>
     <div id="status">Ready.</div>
@@ -275,35 +285,26 @@
 
 
       // ── Section toggling ──────────────────────────────────────
+      // Settings/Filter are always visible and usable — only the Start Crawl
+      // button's enabled state reflects whether a seed has actually been added.
       function toggleSection(bodyId, headerId) {
         var header = document.getElementById(headerId);
-        if (header.classList.contains('locked')) return;
         var body   = document.getElementById(bodyId);
         var nowOpen = body.classList.contains('collapsed');
         body.classList.toggle('collapsed', !nowOpen);
         header.classList.toggle('open', nowOpen);
       }
 
-      function unlockSections() {
-        ['settingsHeader','filterHeader'].forEach(function(id) {
-          var h = document.getElementById(id);
-          h.classList.remove('locked');
-          h.classList.add('toggle', 'open');
-        });
-        document.getElementById('settingsBody').classList.remove('collapsed');
-        document.getElementById('filterBody').classList.remove('collapsed');
-        document.getElementById('crawlStartBtn').disabled = false;
+      function updateStartButtonState() {
+        document.getElementById('crawlStartBtn').disabled = (seeds.length === 0);
       }
 
-      function lockSections() {
-        ['settingsHeader','filterHeader'].forEach(function(id) {
-          var h = document.getElementById(id);
-          h.classList.add('locked');
-          h.classList.remove('toggle', 'open');
-        });
-        document.getElementById('settingsBody').classList.add('collapsed');
-        document.getElementById('filterBody').classList.add('collapsed');
-        document.getElementById('crawlStartBtn').disabled = true;
+      // Builds the same W<mag>/S2:<paperId> ID convention used in the sheet
+      // and log, so a found/added paper can be cross-referenced against the
+      // original ID that was searched for.
+      function seedDisplayId(paper) {
+        var mag = paper.externalIds && paper.externalIds.MAG;
+        return mag ? ('W' + mag) : ('S2:' + paper.paperId);
       }
 
       // ── Step rendering ────────────────────────────────────────
@@ -334,7 +335,7 @@
         if ((paper.authors || []).length > 3) authors += ' et al.';
         document.getElementById('paperTitle').textContent = paper.title || '(No title)';
         document.getElementById('paperMeta').textContent =
-          [paper.year, authors, paper.venue].filter(Boolean).join(' · ');
+          [paper.year, authors, paper.venue, seedDisplayId(paper)].filter(Boolean).join(' · ');
         document.getElementById('paperCount').textContent =
           paper.citationCount != null ? paper.citationCount.toLocaleString() + ' citations' : '';
         document.getElementById('paperCard').style.display = 'block';
@@ -360,9 +361,9 @@
 
         seeds.push(currentPaper);
         renderSeedsList();
+        updateStartButtonState();
 
         if (seeds.length === 1) {
-          unlockSections();
           // Auto-fill crawl name from first seed title if still empty
           var nameEl = document.getElementById('crawlName');
           if (!nameEl.value && currentPaper.title) {
@@ -384,8 +385,8 @@
       function removeSeed(i) {
         seeds.splice(i, 1);
         renderSeedsList();
+        updateStartButtonState();
         if (seeds.length === 0) {
-          lockSections();
           document.getElementById('crawlName').value = '';
           setStatus('All seeds removed. Find a paper to begin.');
         } else {
@@ -412,7 +413,7 @@
           var title = (paper.title || '(No title)');
           if (title.length > 72) title = title.slice(0, 72) + '…';
           var authorNames = (paper.authors || []).slice(0, 2).map(function(a) { return a.name; }).join(', ');
-          var meta = [paper.year, authorNames].filter(Boolean).join(' · ');
+          var meta = [paper.year, authorNames, seedDisplayId(paper)].filter(Boolean).join(' · ');
           info.innerHTML =
             '<strong>' + escHtml(title) + '</strong>' +
             (meta ? '<span class="seed-meta">' + escHtml(meta) + '</span>' : '');
@@ -498,40 +499,69 @@
         var ok    = !!(result && result.paper);
         var label = input.length > 35 ? input.slice(0, 35) + '…' : input;
         var detail = ok
-          ? (result.paper.title || '').slice(0, 55) + ((result.paper.title || '').length > 55 ? '…' : '')
+          ? (result.paper.title || '').slice(0, 55) + ((result.paper.title || '').length > 55 ? '…' : '') +
+            '  [' + seedDisplayId(result.paper) + ']'
           : ((result && result.error) || 'Not found');
         return { ok: ok, label: label, detail: detail };
       }
 
-      function appendStepLine(label, ok, detail) {
+      // Renders (or re-renders, on retry) a step line for one input. Failed
+      // lines get a Retry button that re-issues findSeedPaper for just that
+      // input — so a single rate-limited/timed-out paper can be re-tried
+      // without redoing the whole batch. onResolved fires with the latest
+      // result every time (initial attempt, and again after each retry).
+      function appendStepLine(input, result, onResolved) {
         var container = document.getElementById('steps');
         var div = document.createElement('div');
-        div.className = 'step ' + (ok ? 'step-ok' : 'step-fail');
-        div.innerHTML =
-          '<span class="step-icon">' + (ok ? '✓' : '✗') + '</span>' +
-          '<span><strong>' + escHtml(label) + '</strong> → ' + escHtml(detail) + '</span>';
         container.appendChild(div);
+
+        function render(r) {
+          var d = describeSeedResult(input, r);
+          div.className = 'step ' + (d.ok ? 'step-ok' : 'step-fail');
+          div.innerHTML =
+            '<span class="step-icon">' + (d.ok ? '✓' : '✗') + '</span>' +
+            '<span class="step-text"><strong>' + escHtml(d.label) + '</strong> → ' + escHtml(d.detail) + '</span>';
+          if (!d.ok) {
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'step-retry-btn';
+            btn.textContent = 'Retry';
+            btn.onclick = function() {
+              btn.disabled = true;
+              btn.textContent = 'Retrying…';
+              google.script.run
+                .withSuccessHandler(function(r2) { render(r2); if (onResolved) onResolved(r2); })
+                .withFailureHandler(function(err) { render({ error: err.message }); if (onResolved) onResolved({ error: err.message }); })
+                .findSeedPaper(input);
+            };
+            div.appendChild(btn);
+          }
+        }
+
+        render(result);
+        if (onResolved) onResolved(result);
       }
 
       // ── Bulk results (comma-separated input) — streamed one at a time,
       // staged into pendingBatch for review via "+ Add found papers as seeds" ──
       function renderBatchStep(input, result) {
-        var d = describeSeedResult(input, result);
-        appendStepLine(d.label, d.ok, d.detail);
-        if (d.ok) {
-          pendingBatch.push(result.paper);
-          var btn = document.getElementById('addAllSeedsBtn');
-          btn.textContent = '+ Add ' + pendingBatch.length + ' found paper' +
-                            (pendingBatch.length === 1 ? '' : 's') + ' as seeds';
-          btn.style.display = 'block';
-        }
+        appendStepLine(input, result, function(r) {
+          if (r && r.paper) {
+            pendingBatch.push(r.paper);
+            var btn = document.getElementById('addAllSeedsBtn');
+            btn.textContent = '+ Add ' + pendingBatch.length + ' found paper' +
+                              (pendingBatch.length === 1 ? '' : 's') + ' as seeds';
+            btn.style.display = 'block';
+            setStatus(pendingBatch.length + ' paper(s) found so far. Click the button below to add them, or keep waiting for the rest.');
+          }
+        });
       }
 
       function finishBatchResolve(total) {
         setFindLoading(false);
         var found = pendingBatch.length;
         setStatus(found > 0
-          ? found + ' of ' + total + ' papers found. Click the button to add them.'
+          ? found + ' of ' + total + ' papers found. Click the button to add them, or retry any that failed above.'
           : 'No papers found. Check the IDs and try again.');
       }
 
@@ -546,9 +576,9 @@
         });
         var firstAdd = (seeds.length === added); // true if seeds was empty before
         renderSeedsList();
+        updateStartButtonState();
 
         if (added > 0 && firstAdd) {
-          unlockSections();
           var nameEl = document.getElementById('crawlName');
           if (!nameEl.value && pendingBatch[0] && pendingBatch[0].title) {
             nameEl.value = pendingBatch[0].title.slice(0, 60);
@@ -737,11 +767,6 @@
 
       // ── Log replay ────────────────────────────────────────────
       function applyReplay(replay) {
-        // Settings/Filter live inside sections that start locked and collapsed
-        // until a real seed exists — unlock now so the pre-filled values below
-        // are actually visible instead of silently populating a hidden panel.
-        unlockSections();
-
         // Pre-fill crawl name
         var nameEl = document.getElementById('crawlName');
         if (replay.name) nameEl.value = replay.name;
@@ -787,27 +812,37 @@
         document.getElementById('steps').innerHTML = '';
         setFindLoading(true);
         var restoredCount = 0;
+        function refreshRestoreStatus() {
+          setStatus(
+            restoredCount + ' of ' + inputs.length + ' seed paper(s) restored.' +
+            (restoredCount < inputs.length
+              ? ' Some seeds could not be re-resolved — retry them above or add them manually.'
+              : '') +
+            (replay.canResume
+              ? '\n\nClick "Resume Last Crawl" to continue the existing sheet, or "Start Crawl" for a fresh one.'
+              : '')
+          );
+        }
+
         resolveSeedsSequentially(inputs, {
           onResult: function(input, result) {
-            var d = describeSeedResult(input, result);
-            appendStepLine(d.label, d.ok, d.detail);
-            if (d.ok) {
-              var dup = seeds.some(function(s) { return s.paperId === result.paper.paperId; });
-              if (!dup) { seeds.push(result.paper); restoredCount++; renderSeedsList(); }
-            }
+            appendStepLine(input, result, function(r) {
+              if (r && r.paper) {
+                var dup = seeds.some(function(s) { return s.paperId === r.paper.paperId; });
+                if (!dup) {
+                  seeds.push(r.paper);
+                  restoredCount++;
+                  renderSeedsList();
+                  updateStartButtonState();
+                  refreshRestoreStatus();
+                }
+              }
+            });
           },
           onDone: function() {
             setFindLoading(false);
             document.getElementById('searchInput').value = '';
-            setStatus(
-              restoredCount + ' of ' + inputs.length + ' seed paper(s) restored.' +
-              (restoredCount < inputs.length
-                ? ' Some seeds could not be re-resolved — check the steps above and add them manually if needed.'
-                : '') +
-              (replay.canResume
-                ? '\n\nClick "Resume Last Crawl" to continue the existing sheet, or "Start Crawl" for a fresh one.'
-                : '')
-            );
+            refreshRestoreStatus();
           }
         });
       }

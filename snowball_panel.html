@@ -209,7 +209,9 @@
           .expandSnowball(direction);
       }
 
-      // Restore last saved filter on load, or start with two blank groups
+      // Restore last saved filter on load, or start with two blank groups.
+      // Then check for a pending log replay (only applies if it's a Snowball row —
+      // a stray Crawl replay must be left for the Crawl panel to consume).
       google.script.run
         .withSuccessHandler(function(groups) {
           if (groups && groups.length > 0) {
@@ -218,9 +220,37 @@
             addGroup();
             addGroup();
           }
+          google.script.run
+            .withSuccessHandler(function(replay) { if (replay && replay.type === 'Snowball') applyReplay(replay); })
+            .withFailureHandler(function() {})
+            .getLogReplay();
         })
         .withFailureHandler(function() { addGroup(); addGroup(); })
         .getLastSnowballFilter();
+
+      // ── Log replay ────────────────────────────────────────────
+      // Pre-fills direction/seed/filter from a resumed log row, then
+      // automatically re-runs the seed lookup — no extra clicks needed.
+      function applyReplay(replay) {
+        var directionValue = (replay.backwardPass === 'Backward') ? 'backward' : 'forward';
+        var radio = document.querySelector('input[name="direction"][value="' + directionValue + '"]');
+        if (radio) radio.checked = true;
+
+        if (replay.filterGroups && replay.filterGroups.length > 0) {
+          document.getElementById('groupsContainer').innerHTML = '';
+          groupCount = 0;
+          replay.filterGroups.forEach(function(g) { addGroup(g); });
+        }
+
+        var seedsStr = (replay.seedsStr || '').split('|')[0].trim();
+        if (seedsStr) {
+          document.getElementById('seedInput').value = seedsStr;
+          setStatus('Replay loaded from log — restoring seed "' + seedsStr + '"…');
+          start();
+        } else {
+          setStatus('Replay loaded from log — settings restored.');
+        }
+      }
     </script>
   </body>
 </html>

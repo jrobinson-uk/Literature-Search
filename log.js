@@ -30,8 +30,15 @@ const LOG_EXT_HEADERS = [
 // Sheet access
 // ============================================================
 
+// Case-insensitive lookup — getSheetByName() is case-sensitive in Apps Script,
+// but the sheet is created as "Log" (Code.js) while this module refers to it
+// as lowercase 'log', so an exact-case lookup would never find it.
 function getLogSheet() {
-  return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LOG_SHEET_NAME);
+  var sheets = SpreadsheetApp.getActiveSpreadsheet().getSheets();
+  for (var i = 0; i < sheets.length; i++) {
+    if (sheets[i].getName().toLowerCase() === LOG_SHEET_NAME) return sheets[i];
+  }
+  return null;
 }
 
 // Writes extended headers to row 1 if they haven't been added yet.
@@ -45,8 +52,10 @@ function ensureLogExtHeaders() {
     .setFontWeight('bold')
     .setBackground('#e8f0fe')
     .setFontColor('#1a73e8');
-  // Keep the Resume Code column narrow — users copy from it, not read it at a glance.
-  sheet.setColumnWidth(LOG_EXT.RESUME_CODE, 200);
+  // Keep the Resume Code column fairly narrow — users copy from it, not read it
+  // at a glance — but wide enough to reduce the temptation to drag-select just
+  // the visible text (which would silently truncate the JSON on copy).
+  sheet.setColumnWidth(LOG_EXT.RESUME_CODE, 320);
 }
 
 // ============================================================
@@ -188,7 +197,9 @@ function resumeFromLog() {
 
   if (type === 'Crawl') {
     var crawlSheet   = ss.getSheetByName(name);
-    var isIncomplete = crawlSheet && status !== 'Complete' && status !== 'Error';
+    // Errors are stored as "Error: <message>", never the bare string 'Error' —
+    // match on prefix so errored crawls aren't treated as resumable.
+    var isIncomplete = crawlSheet && status !== 'Complete' && status.indexOf('Error') === -1;
 
     if (isIncomplete) {
       // Restore all crawl script properties so the Resume button works correctly

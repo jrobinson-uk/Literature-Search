@@ -221,6 +221,10 @@
         </div>
         <div class="back-options">
           <div class="check-row">
+            <input type="checkbox" id="matchesOnlyCheck" checked>
+            <label for="matchesOnlyCheck">Only log matching papers</label>
+          </div>
+          <div class="check-row">
             <input type="checkbox" id="runBackwardCheck" onchange="toggleExpandOption()">
             <label for="runBackwardCheck">Run backward pass after forward crawl</label>
           </div>
@@ -231,6 +235,11 @@
             </div>
           </div>
         </div>
+        <p class="hint">
+          Unticking "Only log matching papers" also records every paper the crawl looks at but
+          rejects, marked as already-crawled so they aren't expanded further — useful for auditing
+          why a paper didn't make it in. Costs no extra API calls, just extra rows.
+        </p>
         <button id="crawlStartBtn" onclick="startCrawl()" disabled>Start Crawl</button>
         <button id="crawlResumeBtn" onclick="resumeCrawl()">Resume Last Crawl</button>
       </div>
@@ -433,20 +442,16 @@
         setFindLoading(true);
         setStatus('Searching…');
 
-        // Comma-separated list → bulk resolve
+        // Comma-separated list → resolve one at a time, streaming results in as
+        // they arrive. A slow/rate-limited paper no longer blocks the rest of
+        // the batch or hides progress until everything finishes.
         var parts = raw.split(',').map(function(s) { return s.trim(); }).filter(Boolean);
         if (parts.length > 1) {
-          setStatus('Resolving ' + parts.length + ' papers…');
-          google.script.run
-            .withSuccessHandler(function(results) {
-              handleMultipleResults(results);
-              setFindLoading(false);
-            })
-            .withFailureHandler(function(err) {
-              setStatus('Error: ' + err.message);
-              setFindLoading(false);
-            })
-            .findMultipleSeedPapers(parts);
+          setStatus('Resolving ' + parts.length + ' papers — you can keep configuring crawl settings and filters below while this runs.');
+          resolveSeedsSequentially(parts, {
+            onResult: function(input, result) { renderBatchStep(input, result); },
+            onDone:   function() { finishBatchResolve(parts.length); }
+          });
           return;
         }
 
@@ -470,38 +475,64 @@
           .findSeedPaper(raw);
       }
 
-      // ── Bulk results (comma-separated input) ──────────────────
-      function handleMultipleResults(results) {
-        var container = document.getElementById('steps');
-        container.innerHTML = '';
-        pendingBatch = [];
-
-        results.forEach(function(r) {
-          var label = r.input.length > 35 ? r.input.slice(0, 35) + '…' : r.input;
-          var div   = document.createElement('div');
-          var ok    = !!r.paper;
-          div.className = 'step ' + (ok ? 'step-ok' : 'step-fail');
-          var detail = ok
-            ? escHtml((r.paper.title || '').slice(0, 55)) + ((r.paper.title || '').length > 55 ? '…' : '')
-            : escHtml(r.error || 'Not found');
-          div.innerHTML =
-            '<span class="step-icon">' + (ok ? '✓' : '✗') + '</span>' +
-            '<span><strong>' + escHtml(label) + '</strong> → ' + detail + '</span>';
-          container.appendChild(div);
-          if (ok) pendingBatch.push(r.paper);
-        });
-
-        var found  = pendingBatch.length;
-        var total  = results.length;
-        if (found > 0) {
-          var btn = document.getElementById('addAllSeedsBtn');
-          btn.textContent = '+ Add ' + found + ' of ' + total + ' paper' +
-                            (found === 1 ? '' : 's') + ' as seeds';
-          btn.style.display = 'block';
-          setStatus(found + ' of ' + total + ' papers found. Click the button to add them.');
-        } else {
-          setStatus('No papers found. Check the IDs and try again.');
+      // Resolves each input with its own findSeedPaper call, one at a time —
+      // keeps every call comfortably under Apps Script's 6-minute execution
+      // limit (each carries its own bounded rate-limit back-off) and lets the
+      // panel show progress, rather than freezing for one giant batch call.
+      function resolveSeedsSequentially(inputs, opts) {
+        var onResult = (opts && opts.onResult) || function() {};
+        var onDone   = (opts && opts.onDone)   || function() {};
+        var i = 0;
+        function next() {
+          if (i >= inputs.length) { onDone(); return; }
+          var input = inputs[i++];
+          google.script.run
+            .withSuccessHandler(function(result) { onResult(input, result); next(); })
+            .withFailureHandler(function(err)    { onResult(input, { error: err.message }); next(); })
+            .findSeedPaper(input);
         }
+        next();
+      }
+
+      function describeSeedResult(input, result) {
+        var ok    = !!(result && result.paper);
+        var label = input.length > 35 ? input.slice(0, 35) + '…' : input;
+        var detail = ok
+          ? (result.paper.title || '').slice(0, 55) + ((result.paper.title || '').length > 55 ? '…' : '')
+          : ((result && result.error) || 'Not found');
+        return { ok: ok, label: label, detail: detail };
+      }
+
+      function appendStepLine(label, ok, detail) {
+        var container = document.getElementById('steps');
+        var div = document.createElement('div');
+        div.className = 'step ' + (ok ? 'step-ok' : 'step-fail');
+        div.innerHTML =
+          '<span class="step-icon">' + (ok ? '✓' : '✗') + '</span>' +
+          '<span><strong>' + escHtml(label) + '</strong> → ' + escHtml(detail) + '</span>';
+        container.appendChild(div);
+      }
+
+      // ── Bulk results (comma-separated input) — streamed one at a time,
+      // staged into pendingBatch for review via "+ Add found papers as seeds" ──
+      function renderBatchStep(input, result) {
+        var d = describeSeedResult(input, result);
+        appendStepLine(d.label, d.ok, d.detail);
+        if (d.ok) {
+          pendingBatch.push(result.paper);
+          var btn = document.getElementById('addAllSeedsBtn');
+          btn.textContent = '+ Add ' + pendingBatch.length + ' found paper' +
+                            (pendingBatch.length === 1 ? '' : 's') + ' as seeds';
+          btn.style.display = 'block';
+        }
+      }
+
+      function finishBatchResolve(total) {
+        setFindLoading(false);
+        var found = pendingBatch.length;
+        setStatus(found > 0
+          ? found + ' of ' + total + ' papers found. Click the button to add them.'
+          : 'No papers found. Check the IDs and try again.');
       }
 
       // Adds every paper in pendingBatch to the seeds list (deduped)
@@ -549,6 +580,7 @@
         var groups         = getGroupsFromPanel();
         var runBackward    = document.getElementById('runBackwardCheck').checked;
         var expandBackward = document.getElementById('expandBackwardCheck').checked;
+        var matchesOnly    = document.getElementById('matchesOnlyCheck').checked;
 
         if (!crawlName)          { setStatus('Please enter a name for this crawl.'); return; }
         if (groups.length === 0) { setStatus('Please add at least one filter group.'); return; }
@@ -559,7 +591,7 @@
           .withSuccessHandler(function(msg) { setStatus(msg); setLoading(false); })
           .withFailureHandler(function(err) { setStatus('Error: ' + err.message); setLoading(false); })
           .startCrawl(seeds, 'forward', maxDepth, maxPapers, groups, crawlName,
-                      { runBackward: runBackward, expandBackward: expandBackward });
+                      { runBackward: runBackward, expandBackward: expandBackward, matchesOnly: matchesOnly });
       }
 
       function resumeCrawl() {
@@ -661,7 +693,7 @@
           }
           // After groups are ready, check for a pending log replay
           google.script.run
-            .withSuccessHandler(function(replay) { if (replay) applyReplay(replay); })
+            .withSuccessHandler(function(replay) { if (replay && replay.type === 'Crawl') applyReplay(replay); })
             .withFailureHandler(function() {})
             .getLogReplay();
         })
@@ -670,13 +702,24 @@
         })
         .getLastSnowballFilter();
 
+      // Tolerates stray leading/trailing characters around the pasted JSON
+      // (e.g. extra whitespace) by falling back to the outermost {...} span.
+      // Can't recover a genuinely truncated paste — the JSON itself has to
+      // be complete for either attempt to succeed.
+      function parseResumeCode(raw) {
+        try { return JSON.parse(raw); } catch (e) {}
+        var start = raw.indexOf('{');
+        var end   = raw.lastIndexOf('}');
+        if (start === -1 || end === -1 || end <= start) return null;
+        try { return JSON.parse(raw.slice(start, end + 1)); } catch (e2) { return null; }
+      }
+
       // ── Resume code paste bar ────────────────────────────────
       function loadFromCode() {
         var raw = document.getElementById('resumeCodeInput').value.trim();
         if (!raw) { setStatus('Paste a resume code from the log sheet first.'); return; }
-        var replay;
-        try { replay = JSON.parse(raw); }
-        catch (e) {
+        var replay = parseResumeCode(raw);
+        if (!replay) {
           setStatus('Invalid resume code — copy the full JSON text from the "Resume Code" column in the log sheet and paste it here.');
           return;
         }
@@ -694,6 +737,11 @@
 
       // ── Log replay ────────────────────────────────────────────
       function applyReplay(replay) {
+        // Settings/Filter live inside sections that start locked and collapsed
+        // until a real seed exists — unlock now so the pre-filled values below
+        // are actually visible instead of silently populating a hidden panel.
+        unlockSections();
+
         // Pre-fill crawl name
         var nameEl = document.getElementById('crawlName');
         if (replay.name) nameEl.value = replay.name;
@@ -719,26 +767,49 @@
           replay.filterGroups.forEach(function(g) { addGroup(g); });
         }
 
-        // Pre-fill seed IDs into the search input (pipe-sep → comma-sep)
-        if (replay.seedsStr) {
-          document.getElementById('searchInput').value =
-            replay.seedsStr.replace(/ \| /g, ', ');
-        }
-
-        // Show appropriate status message
         if (replay.canResume) {
           setStatus(
-            'Replay loaded from log.\n\n' +
+            'Replay loaded from log — settings restored.\n\n' +
             'RESUME: Click "Resume Last Crawl" to continue the existing crawl sheet.\n\n' +
-            'FRESH RUN: Find seeds below and click "Start Crawl" for a new sheet ' +
-            'with the same settings.'
+            'FRESH RUN: re-resolving seeds below — click "Start Crawl" once ready for a new sheet with the same settings.'
           );
         } else {
-          setStatus(
-            'Replay loaded from log — settings pre-filled.\n\n' +
-            'Click "Find Paper" to resolve the seeds, then "Start Crawl" to begin a fresh run.'
-          );
+          setStatus('Replay loaded from log — settings restored. Re-resolving seed papers…');
         }
+
+        // Re-resolve and re-add every seed automatically — no extra clicks
+        // needed to restore a previous run.
+        var inputs = (replay.seedsStr || '')
+          .split('|').map(function(s) { return s.trim(); }).filter(Boolean);
+        if (inputs.length === 0) return;
+
+        document.getElementById('searchInput').value = inputs.join(', ');
+        document.getElementById('steps').innerHTML = '';
+        setFindLoading(true);
+        var restoredCount = 0;
+        resolveSeedsSequentially(inputs, {
+          onResult: function(input, result) {
+            var d = describeSeedResult(input, result);
+            appendStepLine(d.label, d.ok, d.detail);
+            if (d.ok) {
+              var dup = seeds.some(function(s) { return s.paperId === result.paper.paperId; });
+              if (!dup) { seeds.push(result.paper); restoredCount++; renderSeedsList(); }
+            }
+          },
+          onDone: function() {
+            setFindLoading(false);
+            document.getElementById('searchInput').value = '';
+            setStatus(
+              restoredCount + ' of ' + inputs.length + ' seed paper(s) restored.' +
+              (restoredCount < inputs.length
+                ? ' Some seeds could not be re-resolved — check the steps above and add them manually if needed.'
+                : '') +
+              (replay.canResume
+                ? '\n\nClick "Resume Last Crawl" to continue the existing sheet, or "Start Crawl" for a fresh one.'
+                : '')
+            );
+          }
+        });
       }
     </script>
   </body>

@@ -156,6 +156,7 @@ function crawlBatchTrigger() {
     var maxPapers      = parseInt(props.getProperty('CRAWL_MAX_PAPERS')  || '300');
     var runBackward    = props.getProperty('CRAWL_RUN_BACKWARD')    === 'true';
     var expandBackward = props.getProperty('CRAWL_EXPAND_BACKWARD') === 'true';
+    var matchesOnly    = props.getProperty('CRAWL_MATCHES_ONLY')    !== 'false';
     var logRow         = parseInt(props.getProperty('CRAWL_LOG_ROW') || '0') || 0;
 
     var result;
@@ -172,7 +173,7 @@ function crawlBatchTrigger() {
       }
 
       setCrawlStatus(sheet, phaseLabel + ' — batch ' + batch + '…');
-      result = runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir);
+      result = runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, matchesOnly);
 
       if (result.indexOf('Time limit') !== -1) {
         props.setProperty('CRAWL_BATCH_NUM', String(batch + 1));
@@ -184,7 +185,7 @@ function crawlBatchTrigger() {
     // ── Backward phase ────────────────────────────────────────
     } else if (phase === 'backward') {
       setCrawlStatus(sheet, 'Backward pass — batch ' + batch + '…');
-      result = runBackwardPass(sheet, groups, maxPapers, expandBackward);
+      result = runBackwardPass(sheet, groups, maxPapers, expandBackward, matchesOnly);
 
       if (result.indexOf('Time limit') !== -1) {
         props.setProperty('CRAWL_BATCH_NUM', String(batch + 1));
@@ -519,8 +520,11 @@ function buildCrawlRow(candidate, direction, depth, parentId, dir) {
 
 // paperDir: direction marker written into the Direction column for newly-added rows.
 // "F" for forward-pass papers (default), "B" when expanding backward-discovered papers.
-function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir) {
-  paperDir = paperDir || "F";
+// matchesOnly: when false, non-matching candidates are also written (as
+// already-Crawled rows, so they aren't re-queued) instead of being discarded.
+function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, matchesOnly) {
+  paperDir    = paperDir || "F";
+  matchesOnly = matchesOnly !== false;
   var startTime = Date.now();
   var processed = 0;
 
@@ -566,15 +570,20 @@ function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir) {
     // Pace S2 requests — stay within rate limits even without an API key
     if (direction === 'forward') Utilities.sleep(1100);
 
-    // Filter: not already in sheet, matches the query
+    // Filter: not already in sheet; matches are queued for further expansion,
+    // non-matches (when matchesOnly is off) are recorded but marked Crawled
+    // so they aren't independently expanded.
     var existingIds = getCrawlExistingIds(sheet);
     var matchRows   = [];
     for (var i = 0; i < candidates.length; i++) {
       var c   = candidates[i];
       var cId = getCandidateId(c, direction);
       if (existingIds.has(cId)) continue;
-      if (!jsMatchesFilter(getCandidateAbstract(c, direction), groups)) continue;
-      matchRows.push(buildCrawlRow(c, direction, depth + 1, id, paperDir));
+      var isMatch = jsMatchesFilter(getCandidateAbstract(c, direction), groups);
+      if (!isMatch && matchesOnly) continue;
+      var row = buildCrawlRow(c, direction, depth + 1, id, paperDir);
+      if (!isMatch) row[CRAWL_COL.CRAWLED - 1] = true;
+      matchRows.push(row);
       existingIds.add(cId); // deduplicate within this batch before writing
     }
 
@@ -618,6 +627,10 @@ function resolveToS2Seed(input) {
   // Bare S2 paper ID (40 hex chars)
   else if (/^[a-f0-9]{40}$/i.test(clean)) {
     s2Ref = clean;
+  }
+  // Our own "S2:<hash>" sheet/log ID format (see getCandidateId / startCrawl)
+  else if (/^S2:[a-f0-9]{40}$/i.test(clean)) {
+    s2Ref = clean.replace(/^S2:/i, '');
   }
   // ArXiv URL  e.g. https://arxiv.org/abs/2301.00001
   else if (/arxiv\.org\/abs\//i.test(clean)) {
@@ -683,6 +696,9 @@ function findSeedPaper(input) {
     steps.push({ text: 'Recognised as Semantic Scholar URL', ok: true });
   } else if (/^[a-f0-9]{40}$/i.test(clean)) {
     s2Ref = clean;
+    steps.push({ text: 'Recognised as Semantic Scholar paper ID', ok: true });
+  } else if (/^S2:[a-f0-9]{40}$/i.test(clean)) {
+    s2Ref = clean.replace(/^S2:/i, '');
     steps.push({ text: 'Recognised as Semantic Scholar paper ID', ok: true });
   } else if (/arxiv\.org\/abs\//i.test(clean)) {
     s2Ref = 'ArXiv:' + clean.replace(/.*arxiv\.org\/abs\//i, '').replace(/v\d+$/, '').trim();
@@ -815,7 +831,8 @@ function s2GetReferences(paperSheetId) {
 // When expandBackward=true those papers get Crawled=FALSE so the forward loop
 // will later fetch their citations.  Batches against CRAWL_TIME_LIMIT_MS and
 // persists progress in CRAWL_BACKWARD_IDX between trigger invocations.
-function runBackwardPass(sheet, groups, maxPapers, expandBackward) {
+function runBackwardPass(sheet, groups, maxPapers, expandBackward, matchesOnly) {
+  matchesOnly = matchesOnly !== false;
   var startTime = Date.now();
   var props     = PropertiesService.getScriptProperties();
   var idx       = parseInt(props.getProperty('CRAWL_BACKWARD_IDX') || '0');
@@ -857,11 +874,13 @@ function runBackwardPass(sheet, groups, maxPapers, expandBackward) {
       var mag   = ref.externalIds && ref.externalIds.MAG;
       var refId = mag ? ('W' + mag) : ('S2:' + ref.paperId);
       if (allIds.has(refId)) return;
-      if (!jsMatchesFilter(ref.abstract || '', groups)) return;
+      var isMatch = jsMatchesFilter(ref.abstract || '', groups);
+      if (!isMatch && matchesOnly) return;
       allIds.add(refId);
       var row = crawlRowFromS2(ref, 0, paperId, 'B');
-      // If not expanding, mark as already-crawled so the loop skips them
-      if (!expandBackward) row[CRAWL_COL.CRAWLED - 1] = true;
+      // Mark already-crawled (skip re-queueing) if not expanding, or if this
+      // is a non-match recorded only for visibility.
+      if (!expandBackward || !isMatch) row[CRAWL_COL.CRAWLED - 1] = true;
       newRows.push(row);
     });
 
@@ -877,21 +896,6 @@ function runBackwardPass(sheet, groups, maxPapers, expandBackward) {
   return 'Backward pass complete. Processed ' + processed + ' papers.';
 }
 
-// Resolves multiple inputs (DOIs, W-IDs, ArXiv IDs, S2 IDs, URLs) in one call.
-// Returns an array of { input, paper, error } — steps are omitted to keep the
-// payload small.  Called from the panel when the user pastes a comma-separated list.
-function findMultipleSeedPapers(inputs) {
-  return inputs.map(function(raw) {
-    var input  = (raw || '').trim();
-    var result = findSeedPaper(input);
-    return {
-      input: input,
-      paper: result.paper || null,
-      error: result.error || null
-    };
-  });
-}
-
 // ============================================================
 // Public entry points (called from panel via google.script.run)
 // ============================================================
@@ -905,6 +909,7 @@ function startCrawl(seeds, direction, maxDepth, maxPapers, groups, crawlName, op
     var opts           = options || {};
     var runBackward    = !!opts.runBackward;
     var expandBackward = !!opts.expandBackward;
+    var matchesOnly    = opts.matchesOnly !== false;
 
     var sheetName = (crawlName || '').trim() || newCrawlSheetName();
     var seedLabel = seeds.length === 1
@@ -923,6 +928,7 @@ function startCrawl(seeds, direction, maxDepth, maxPapers, groups, crawlName, op
     props.setProperty('CRAWL_PHASE',            'forward');
     props.setProperty('CRAWL_RUN_BACKWARD',     runBackward    ? 'true' : 'false');
     props.setProperty('CRAWL_EXPAND_BACKWARD',  expandBackward ? 'true' : 'false');
+    props.setProperty('CRAWL_MATCHES_ONLY',     matchesOnly    ? 'true' : 'false');
 
     // Log the crawl — store the row number so the trigger can update status later
     var seedIds = seeds.map(function(seed) {

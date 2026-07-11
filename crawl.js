@@ -46,7 +46,14 @@ const CRAWL_DEFAULT_FILTER_FORMULA =
   '=MAP(A2:A,H2:H,LAMBDA(a,h,IF(ROW(a)=2,"Filter Match",IF(a<>"",FALSE,""))))';
 
 const CRAWL_ROW_HEIGHT    = 60;
-const CRAWL_TIME_LIMIT_MS = 5 * 60 * 1000; // 5 min — safe under Apps Script 6-min limit
+// 4 min, not 5 — a single loop iteration's fetch/back-off can occasionally run
+// long (S2 429 retries alone can take ~43s), so this leaves more headroom
+// before Apps Script's hard 6-min per-execution kill.
+const CRAWL_TIME_LIMIT_MS = 4 * 60 * 1000;
+// How many consecutive crawlBatchTrigger failures (any uncaught exception) are
+// tolerated before giving up and deleting the trigger — below this, a failure
+// is assumed transient and the still-alive trigger retries next minute.
+const CRAWL_MAX_CONSEC_FAILURES = 3;
 
 // Semantic Scholar back-off delays (ms) applied on HTTP 429 responses.
 // Sequence: 3 s → 10 s → 30 s (then give up / surface error).
@@ -142,6 +149,10 @@ function crawlBatchTrigger() {
 
   try {
     var props     = PropertiesService.getScriptProperties();
+    // Reset up front — if this invocation throws, the catch block below
+    // increments from this baseline, so only genuinely consecutive failures
+    // (not this execution's own past attempts) count toward the threshold.
+    props.setProperty('CRAWL_CONSEC_FAILURES', '0');
     var sheetName = props.getProperty('CRAWL_ACTIVE_SHEET');
     if (!sheetName) { deleteCrawlTrigger(); return; }
 
@@ -175,9 +186,16 @@ function crawlBatchTrigger() {
       setCrawlStatus(sheet, phaseLabel + ' — batch ' + batch + '…');
       result = runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, matchesOnly);
 
-      if (result.indexOf('Time limit') !== -1) {
+      if (result.status === 'time-limit') {
         props.setProperty('CRAWL_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, phaseLabel + ' — batch ' + batch + ' done, batch ' + (batch + 1) + ' starting…');
+      } else if (result.status === 'paper-limit') {
+        // Hard cap reached — a deliberate stop, not completion. The log row's
+        // 'Paper Limit' status was already set inside runCrawlLoop; don't run
+        // it through transitionFromForward, which would overwrite it as
+        // 'Complete' even though the queue still has unprocessed rows.
+        deleteCrawlTrigger();
+        setCrawlStatus(sheet, result.message);
       } else {
         transitionFromForward(props, sheet, runBackward, expandBackward, logRow);
       }
@@ -187,7 +205,7 @@ function crawlBatchTrigger() {
       setCrawlStatus(sheet, 'Backward pass — batch ' + batch + '…');
       result = runBackwardPass(sheet, groups, maxPapers, expandBackward, matchesOnly);
 
-      if (result.indexOf('Time limit') !== -1) {
+      if (result.status === 'time-limit') {
         props.setProperty('CRAWL_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, 'Backward pass — batch ' + batch + ' done, batch ' + (batch + 1) + ' starting…');
       } else {
@@ -207,15 +225,27 @@ function crawlBatchTrigger() {
     }
 
   } catch (e) {
-    deleteCrawlTrigger();
+    var propsE    = PropertiesService.getScriptProperties();
+    var failCount = (parseInt(propsE.getProperty('CRAWL_CONSEC_FAILURES') || '0') || 0) + 1;
+    propsE.setProperty('CRAWL_CONSEC_FAILURES', String(failCount));
+
     try {
-      var ep  = PropertiesService.getScriptProperties();
       var es  = SpreadsheetApp.getActiveSpreadsheet()
-                  .getSheetByName(ep.getProperty('CRAWL_ACTIVE_SHEET'));
-      var elr = parseInt(ep.getProperty('CRAWL_LOG_ROW') || '0') || 0;
-      var msg = 'Error: ' + e.message.slice(0, 60);
-      if (es)  setCrawlStatus(es, msg);
-      if (elr) updateLogRow(elr, msg);
+                  .getSheetByName(propsE.getProperty('CRAWL_ACTIVE_SHEET'));
+      var elr = parseInt(propsE.getProperty('CRAWL_LOG_ROW') || '0') || 0;
+
+      if (failCount >= CRAWL_MAX_CONSEC_FAILURES) {
+        // Persistent failure — give up and surface it clearly.
+        deleteCrawlTrigger();
+        var msg = 'Error: ' + e.message.slice(0, 60);
+        if (es)  setCrawlStatus(es, msg);
+        if (elr) updateLogRow(elr, msg);
+      } else {
+        // Likely transient (a momentary API/Sheets hiccup) — leave the
+        // trigger alive so the next minute's firing retries automatically.
+        var retryMsg = 'Transient error (retry ' + failCount + '/' + CRAWL_MAX_CONSEC_FAILURES + '): ' + e.message.slice(0, 60);
+        if (es) setCrawlStatus(es, retryMsg);
+      }
     } catch (e2) { /* swallow secondary error */ }
   } finally {
     lock.releaseLock();
@@ -533,14 +563,14 @@ function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, m
     if (Date.now() - startTime > CRAWL_TIME_LIMIT_MS) {
       updateCrawlMatchedCites(sheet);
       var remaining = countUncrawled(sheet);
-      return "Time limit reached. Processed " + processed + " papers this session; " +
-             remaining + " remain in queue. Click Resume Crawl to continue.";
+      return { status: 'time-limit', message: "Time limit reached. Processed " + processed + " papers this session; " +
+             remaining + " remain in queue. Click Resume Crawl to continue." };
     }
 
     var next = findNextUncrawled(sheet);
     if (!next) {
       updateCrawlMatchedCites(sheet);
-      return "Crawl complete. " + processed + " papers processed in this session.";
+      return { status: 'complete', message: "Crawl complete. " + processed + " papers processed in this session." };
     }
 
     var sheetRow = next.sheetRow;
@@ -598,8 +628,8 @@ function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, m
         updateCrawlMatchedCites(sheet);
         var logRowPL = parseInt(PropertiesService.getScriptProperties().getProperty('CRAWL_LOG_ROW') || '0') || 0;
         updateLogRow(logRowPL, 'Paper Limit');
-        return "Paper limit (" + maxPapers + ") reached. The queue still has unprocessed papers — " +
-               "click Resume Crawl to continue (existing queue only; no new papers will be added).";
+        return { status: 'paper-limit', message: "Paper limit (" + maxPapers + ") reached. The queue still has unprocessed papers — " +
+               "click Resume Crawl to continue (existing queue only; no new papers will be added)." };
       }
     }
 
@@ -838,7 +868,7 @@ function runBackwardPass(sheet, groups, maxPapers, expandBackward, matchesOnly) 
   var idx       = parseInt(props.getProperty('CRAWL_BACKWARD_IDX') || '0');
 
   var lastRow = getCrawlLastDataRow(sheet);
-  if (lastRow < 3) return 'Backward pass complete. No papers found.';
+  if (lastRow < 3) return { status: 'complete', message: 'Backward pass complete. No papers found.' };
 
   var numRows = lastRow - 2;
   var data    = sheet.getRange(3, 1, numRows, CRAWL_NUM_COLS).getValues();
@@ -857,8 +887,8 @@ function runBackwardPass(sheet, groups, maxPapers, expandBackward, matchesOnly) 
     if (Date.now() - startTime > CRAWL_TIME_LIMIT_MS) {
       props.setProperty('CRAWL_BACKWARD_IDX', String(idx));
       updateCrawlMatchedCites(sheet);
-      return 'Time limit reached in backward pass. Processed ' + processed +
-             ' papers; ' + (paperIds.length - idx) + ' remain.';
+      return { status: 'time-limit', message: 'Time limit reached in backward pass. Processed ' + processed +
+             ' papers; ' + (paperIds.length - idx) + ' remain.' };
     }
 
     var paperId = paperIds[idx++];
@@ -893,7 +923,7 @@ function runBackwardPass(sheet, groups, maxPapers, expandBackward, matchesOnly) 
 
   props.setProperty('CRAWL_BACKWARD_IDX', String(idx));
   updateCrawlMatchedCites(sheet);
-  return 'Backward pass complete. Processed ' + processed + ' papers.';
+  return { status: 'complete', message: 'Backward pass complete. Processed ' + processed + ' papers.' };
 }
 
 // ============================================================

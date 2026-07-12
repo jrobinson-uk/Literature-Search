@@ -544,6 +544,22 @@ function buildCrawlRow(candidate, direction, depth, parentId, dir) {
     : crawlRowFromOpenAlex(candidate, depth, parentId, dir);
 }
 
+// Prefixes a paper's Title cell with a visible failure marker when its
+// candidate fetch (citations or references) throws, so a genuinely-failed
+// lookup is distinguishable from one that succeeded but found nothing new —
+// both would otherwise leave the row Crawled=TRUE with zero new rows added,
+// making them look identical in the exported data. Deliberately reuses the
+// Title column rather than adding a new one, since a new column would shift
+// every fixed column position (CRAWL_COL.*) and the term-helper/filter-formula
+// columns that come after it, corrupting any crawl sheet created before this
+// change if it's ever resumed.
+function markFetchFailure(sheet, sheetRow, e) {
+  var cell     = sheet.getRange(sheetRow, CRAWL_COL.TITLE);
+  var curTitle = String(cell.getValue());
+  var baseTitle = curTitle.replace(/^⚠ \[fetch failed:[^\]]*\]\s*/, '');
+  cell.setValue('⚠ [fetch failed: ' + e.message.slice(0, 60) + '] ' + baseTitle);
+}
+
 // ============================================================
 // Main crawl loop
 // ============================================================
@@ -592,6 +608,7 @@ function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, m
         ? fetchForwardCandidates(id, title)
         : fetchBackwardCandidates(id);
     } catch (e) {
+      markFetchFailure(sheet, sheetRow, e);
       sheet.getRange(sheetRow, CRAWL_COL.CRAWLED).setValue(true);
       processed++;
       continue;
@@ -874,11 +891,14 @@ function runBackwardPass(sheet, groups, maxPapers, expandBackward, matchesOnly) 
   var data    = sheet.getRange(3, 1, numRows, CRAWL_NUM_COLS).getValues();
 
   // Build current ID set for dedup and collect all paper IDs to process
-  var allIds   = new Set();
-  var paperIds = [];
-  data.forEach(function(row) {
+  // (paperSheetRows tracks each ID's real row — rows with a blank ID are
+  // skipped, so the index into paperIds doesn't line up with row number).
+  var allIds         = new Set();
+  var paperIds       = [];
+  var paperSheetRows = [];
+  data.forEach(function(row, i) {
     var id = String(row[CRAWL_COL.ID - 1] || '').trim();
-    if (id) { allIds.add(id); paperIds.push(id); }
+    if (id) { allIds.add(id); paperIds.push(id); paperSheetRows.push(3 + i); }
   });
 
   var processed = 0;
@@ -891,12 +911,16 @@ function runBackwardPass(sheet, groups, maxPapers, expandBackward, matchesOnly) 
              ' papers; ' + (paperIds.length - idx) + ' remain.' };
     }
 
+    var paperSheetRow = paperSheetRows[idx];
     var paperId = paperIds[idx++];
     processed++;
     Utilities.sleep(1100);
 
     var refs = [];
-    try { refs = s2GetReferences(paperId); } catch (e) { continue; }
+    try { refs = s2GetReferences(paperId); } catch (e) {
+      markFetchFailure(sheet, paperSheetRow, e);
+      continue;
+    }
 
     var newRows = [];
     refs.forEach(function(ref) {

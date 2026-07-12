@@ -203,13 +203,16 @@ function crawlBatchTrigger() {
     // ── Backward phase ────────────────────────────────────────
     } else if (phase === 'backward') {
       setCrawlStatus(sheet, 'Backward pass — batch ' + batch + '…');
-      result = runBackwardPass(sheet, groups, maxPapers, expandBackward, matchesOnly);
+      result = runBackwardPass(sheet, groups, maxDepth, maxPapers, expandBackward, matchesOnly);
 
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, 'Backward pass — batch ' + batch + ' done, batch ' + (batch + 1) + ' starting…');
       } else {
-        // Backward pass complete
+        // Backward pass complete — only ever do this once per crawl, so
+        // transitionFromForward doesn't re-enter it again after the
+        // expand-backward forward phase (below) itself completes.
+        props.setProperty('CRAWL_BACKWARD_DONE', 'true');
         if (expandBackward && countUncrawled(sheet) > 0) {
           // Backward papers written with Crawled=FALSE — run forward on them
           props.setProperty('CRAWL_PHASE',              'forward');
@@ -253,8 +256,14 @@ function crawlBatchTrigger() {
 }
 
 // Helper: handles the forward→backward (or forward→complete) transition.
+// A crawl only ever runs ONE backward pass — without CRAWL_BACKWARD_DONE,
+// this would re-enter 'backward' every time ANY forward phase completes,
+// including the "expand backward papers" forward phase itself, oscillating
+// forward<->backward indefinitely and pulling in ever-older, ever-more
+// distant papers each cycle instead of stopping once genuinely done.
 function transitionFromForward(props, sheet, runBackward, expandBackward, logRow) {
-  if (runBackward) {
+  var backwardAlreadyDone = props.getProperty('CRAWL_BACKWARD_DONE') === 'true';
+  if (runBackward && !backwardAlreadyDone) {
     props.setProperty('CRAWL_PHASE',              'backward');
     props.setProperty('CRAWL_BACKWARD_IDX',       '0');
     props.setProperty('CRAWL_EXPANDING_BACKWARD', 'false');
@@ -878,7 +887,7 @@ function s2GetReferences(paperSheetId) {
 // When expandBackward=true those papers get Crawled=FALSE so the forward loop
 // will later fetch their citations.  Batches against CRAWL_TIME_LIMIT_MS and
 // persists progress in CRAWL_BACKWARD_IDX between trigger invocations.
-function runBackwardPass(sheet, groups, maxPapers, expandBackward, matchesOnly) {
+function runBackwardPass(sheet, groups, maxDepth, maxPapers, expandBackward, matchesOnly) {
   matchesOnly = matchesOnly !== false;
   var startTime = Date.now();
   var props     = PropertiesService.getScriptProperties();
@@ -893,12 +902,21 @@ function runBackwardPass(sheet, groups, maxPapers, expandBackward, matchesOnly) 
   // Build current ID set for dedup and collect all paper IDs to process
   // (paperSheetRows tracks each ID's real row — rows with a blank ID are
   // skipped, so the index into paperIds doesn't line up with row number).
+  // paperDepths tracks each ID's own Depth, so newly-discovered references
+  // inherit "parent depth + 1" instead of always resetting to 0 — otherwise
+  // maxDepth stops bounding anything once backward discovery kicks in.
   var allIds         = new Set();
-  var paperIds       = [];
-  var paperSheetRows = [];
+  var paperIds        = [];
+  var paperSheetRows  = [];
+  var paperDepths     = [];
   data.forEach(function(row, i) {
     var id = String(row[CRAWL_COL.ID - 1] || '').trim();
-    if (id) { allIds.add(id); paperIds.push(id); paperSheetRows.push(3 + i); }
+    if (id) {
+      allIds.add(id);
+      paperIds.push(id);
+      paperSheetRows.push(3 + i);
+      paperDepths.push(parseInt(row[CRAWL_COL.DEPTH - 1]) || 0);
+    }
   });
 
   var processed = 0;
@@ -911,9 +929,16 @@ function runBackwardPass(sheet, groups, maxPapers, expandBackward, matchesOnly) 
              ' papers; ' + (paperIds.length - idx) + ' remain.' };
     }
 
-    var paperSheetRow = paperSheetRows[idx];
-    var paperId = paperIds[idx++];
+    var paperSheetRow  = paperSheetRows[idx];
+    var paperDepth     = paperDepths[idx];
+    var paperId        = paperIds[idx++];
     processed++;
+
+    // Same bound as the forward loop: once a paper's own depth reaches
+    // maxDepth, don't explore further from it — its references would only
+    // ever land at paperDepth + 1, i.e. past the configured limit.
+    if (paperDepth >= maxDepth) continue;
+
     Utilities.sleep(1100);
 
     var refs = [];
@@ -931,7 +956,7 @@ function runBackwardPass(sheet, groups, maxPapers, expandBackward, matchesOnly) 
       var isMatch = jsMatchesFilter(ref.abstract || '', groups);
       if (!isMatch && matchesOnly) return;
       allIds.add(refId);
-      var row = crawlRowFromS2(ref, 0, paperId, 'B');
+      var row = crawlRowFromS2(ref, paperDepth + 1, paperId, 'B');
       // Mark already-crawled (skip re-queueing) if not expanding, or if this
       // is a non-match recorded only for visibility.
       if (!expandBackward || !isMatch) row[CRAWL_COL.CRAWLED - 1] = true;
@@ -989,6 +1014,9 @@ function startCrawl(seeds, direction, maxDepth, maxPapers, groups, crawlName, op
     // this crawl's own forward-citation rows as Direction='B' from the start.
     props.setProperty('CRAWL_EXPANDING_BACKWARD', 'false');
     props.setProperty('CRAWL_BACKWARD_IDX',       '0');
+    // Also script-wide — without resetting, a fresh crawl could inherit
+    // 'true' from an earlier crawl and skip its own (first) backward pass.
+    props.setProperty('CRAWL_BACKWARD_DONE',       'false');
 
     // Log the crawl — store the row number so the trigger can update status later
     var seedIds = seeds.map(function(seed) {

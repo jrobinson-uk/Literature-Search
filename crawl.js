@@ -959,6 +959,12 @@ function startCrawl(seeds, direction, maxDepth, maxPapers, groups, crawlName, op
     props.setProperty('CRAWL_RUN_BACKWARD',     runBackward    ? 'true' : 'false');
     props.setProperty('CRAWL_EXPAND_BACKWARD',  expandBackward ? 'true' : 'false');
     props.setProperty('CRAWL_MATCHES_ONLY',     matchesOnly    ? 'true' : 'false');
+    // These are script-wide properties, not scoped to a single crawl sheet —
+    // without resetting them here, a fresh crawl can inherit 'true' left
+    // over from a previous crawl's backward-expansion phase, mislabeling
+    // this crawl's own forward-citation rows as Direction='B' from the start.
+    props.setProperty('CRAWL_EXPANDING_BACKWARD', 'false');
+    props.setProperty('CRAWL_BACKWARD_IDX',       '0');
 
     // Log the crawl — store the row number so the trigger can update status later
     var seedIds = seeds.map(function(seed) {

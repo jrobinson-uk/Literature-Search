@@ -233,6 +233,10 @@
             <label for="matchesOnlyCheck">Only log matching papers</label>
           </div>
           <div class="check-row">
+            <input type="checkbox" id="yearBoundCheck" checked>
+            <label for="yearBoundCheck">Bound corpus by seed year → present day</label>
+          </div>
+          <div class="check-row">
             <input type="checkbox" id="runBackwardCheck" onchange="toggleExpandOption()">
             <label for="runBackwardCheck">Run backward pass after forward crawl</label>
           </div>
@@ -247,6 +251,12 @@
           Unticking "Only log matching papers" also records every paper the crawl looks at but
           rejects, marked as already-crawled so they aren't expanded further — useful for auditing
           why a paper didn't make it in. Costs no extra API calls, just extra rows.
+        </p>
+        <p class="hint">
+          "Bound corpus by seed year → present day" keeps backward-pass references from wandering
+          arbitrarily far into the past — anything older than your earliest seed (or dated in the
+          future) is treated the same as a non-match: logged if "Only log matching papers" is off,
+          but never scraped for its own references or citations.
         </p>
         <button id="crawlResumeBtn" onclick="resumeCrawl()">Resume Last Crawl</button>
       </div>
@@ -611,6 +621,7 @@
         var runBackward    = document.getElementById('runBackwardCheck').checked;
         var expandBackward = document.getElementById('expandBackwardCheck').checked;
         var matchesOnly    = document.getElementById('matchesOnlyCheck').checked;
+        var yearBound      = document.getElementById('yearBoundCheck').checked;
 
         if (!crawlName)          { setStatus('Please enter a name for this crawl.'); return; }
         if (groups.length === 0) { setStatus('Please add at least one filter group.'); return; }
@@ -621,7 +632,7 @@
           .withSuccessHandler(function(msg) { setStatus(msg); setLoading(false); })
           .withFailureHandler(function(err) { setStatus('Error: ' + err.message); setLoading(false); })
           .startCrawl(seeds, 'forward', maxDepth, maxPapers, groups, crawlName,
-                      { runBackward: runBackward, expandBackward: expandBackward, matchesOnly: matchesOnly });
+                      { runBackward: runBackward, expandBackward: expandBackward, matchesOnly: matchesOnly, yearBound: yearBound });
       }
 
       function resumeCrawl() {

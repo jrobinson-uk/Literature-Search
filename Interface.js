@@ -14,6 +14,7 @@ function onOpen() {
     .addItem('Citation Crawl', 'showCrawlbar')
     .addSeparator()
     .addItem('Load Selected Log Row', 'resumeFromLog')
+    .addItem('Cancel Crawl', 'cancelCrawl')
     .addSeparator()
     .addItem('Set SerpAPI Key', 'promptForKey')
     .addItem('Set OpenAlex Email', 'promptForOpenAlexEmail')

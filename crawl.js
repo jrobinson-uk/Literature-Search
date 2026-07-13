@@ -98,6 +98,7 @@ function s2Fetch(url) {
 // Updates the Crawl Status value cell in row 1 with colour coding:
 //   green  = Complete
 //   red    = Error
+//   grey   = Cancelled
 //   amber  = Running / transitional
 function setCrawlStatus(sheet, status) {
   var cell = sheet.getRange(1, CRAWL_STATUS_VALUE_COL);
@@ -106,6 +107,8 @@ function setCrawlStatus(sheet, status) {
     cell.setBackground('#34a853').setFontColor('#ffffff');
   } else if (status.indexOf('Error') !== -1) {
     cell.setBackground('#e53935').setFontColor('#ffffff');
+  } else if (status === 'Cancelled') {
+    cell.setBackground('#9e9e9e').setFontColor('#ffffff');
   } else {
     cell.setBackground('#f4b400').setFontColor('#333333');
   }
@@ -124,6 +127,39 @@ function deleteCrawlTrigger() {
     if (t.getUniqueId() === id) ScriptApp.deleteTrigger(t);
   });
   props.deleteProperty('CRAWL_TRIGGER_ID');
+}
+
+// True only if the stored trigger ID actually matches a currently-registered
+// trigger — CRAWL_ACTIVE_SHEET can still be set after a crawl completed,
+// errored, or hit its cap, so that alone isn't a reliable "is it running" check.
+function isCrawlRunning() {
+  var id = PropertiesService.getScriptProperties().getProperty('CRAWL_TRIGGER_ID');
+  if (!id) return false;
+  return ScriptApp.getProjectTriggers().some(function(t) { return t.getUniqueId() === id; });
+}
+
+// Menu handler: stops the running crawl's trigger without wiping its state,
+// so "Resume Last Crawl" still works afterward if the user changes their mind.
+function cancelCrawl() {
+  var ui = SpreadsheetApp.getUi();
+  if (!isCrawlRunning()) {
+    ui.alert('No crawl is currently running.');
+    return;
+  }
+  var props     = PropertiesService.getScriptProperties();
+  var sheetName = props.getProperty('CRAWL_ACTIVE_SHEET');
+  var response  = ui.alert('Cancel Crawl',
+    'Stop the currently running crawl ("' + sheetName + '")?\n\n' +
+    'Progress so far is kept — you can still click "Resume Last Crawl" later.',
+    ui.ButtonSet.YES_NO);
+  if (response !== ui.Button.YES) return;
+
+  deleteCrawlTrigger();
+  var sheet  = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
+  var logRow = parseInt(props.getProperty('CRAWL_LOG_ROW') || '0') || 0;
+  if (sheet)  setCrawlStatus(sheet, 'Cancelled');
+  if (logRow) updateLogRow(logRow, 'Cancelled');
+  ui.alert('Crawl cancelled.');
 }
 
 // Creates a 1-minute repeating trigger pointing at crawlBatchTrigger,

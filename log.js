@@ -141,6 +141,8 @@ function setLogStatusStyle_(sheet, rowNum, status) {
     cell.setBackground('#e53935').setFontColor('#ffffff');
   } else if (status === 'Paper Limit') {
     cell.setBackground('#ff9800').setFontColor('#ffffff');
+  } else if (status === 'Cancelled') {
+    cell.setBackground('#9e9e9e').setFontColor('#ffffff');
   } else {
     // Running / transitional
     cell.setBackground('#f4b400').setFontColor('#333333');

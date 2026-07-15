@@ -240,6 +240,12 @@
             <input type="checkbox" id="runBackwardCheck" onchange="toggleExpandOption()">
             <label for="runBackwardCheck">Run backward pass after forward crawl</label>
           </div>
+          <div class="check-sub" id="backwardDepthRow" style="display:none">
+            <label style="font-size:11px;color:#555;display:block;margin-bottom:3px;">
+              Backward depth (hops back from existing papers)
+            </label>
+            <input type="number" id="crawlBackwardDepth" value="1" min="1" max="5">
+          </div>
           <div class="check-sub" id="expandBackwardRow" style="display:none">
             <div class="check-row">
               <input type="checkbox" id="expandBackwardCheck">
@@ -257,6 +263,12 @@
           arbitrarily far into the past — anything older than your earliest seed (or dated in the
           future) is treated the same as a non-match: logged if "Only log matching papers" is off,
           but never scraped for its own references or citations.
+        </p>
+        <p class="hint">
+          "Backward depth" caps how many additional hops of reference-lookups the backward pass runs,
+          independent of "Max depth" above. A paper at or past this depth is still recorded but its own
+          references aren't followed — without this, backward search recursively follows every paper it
+          finds, turning into a second full-depth crawl.
         </p>
         <button id="crawlResumeBtn" onclick="resumeCrawl()">Resume Last Crawl</button>
       </div>
@@ -608,6 +620,7 @@
       function toggleExpandOption() {
         var show = document.getElementById('runBackwardCheck').checked;
         document.getElementById('expandBackwardRow').style.display = show ? 'block' : 'none';
+        document.getElementById('backwardDepthRow').style.display  = show ? 'block' : 'none';
         if (!show) document.getElementById('expandBackwardCheck').checked = false;
       }
 
@@ -622,6 +635,7 @@
         var expandBackward = document.getElementById('expandBackwardCheck').checked;
         var matchesOnly    = document.getElementById('matchesOnlyCheck').checked;
         var yearBound      = document.getElementById('yearBoundCheck').checked;
+        var backwardDepth  = parseInt(document.getElementById('crawlBackwardDepth').value) || 1;
 
         if (!crawlName)          { setStatus('Please enter a name for this crawl.'); return; }
         if (groups.length === 0) { setStatus('Please add at least one filter group.'); return; }
@@ -632,7 +646,8 @@
           .withSuccessHandler(function(msg) { setStatus(msg); setLoading(false); })
           .withFailureHandler(function(err) { setStatus('Error: ' + err.message); setLoading(false); })
           .startCrawl(seeds, 'forward', maxDepth, maxPapers, groups, crawlName,
-                      { runBackward: runBackward, expandBackward: expandBackward, matchesOnly: matchesOnly, yearBound: yearBound });
+                      { runBackward: runBackward, expandBackward: expandBackward, matchesOnly: matchesOnly,
+                        yearBound: yearBound, backwardDepth: backwardDepth });
       }
 
       function resumeCrawl() {

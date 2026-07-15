@@ -206,6 +206,7 @@ function crawlBatchTrigger() {
     var matchesOnly    = props.getProperty('CRAWL_MATCHES_ONLY')    !== 'false';
     var yearFloor      = parseInt(props.getProperty('CRAWL_YEAR_FLOOR') || '0') || 0;
     var yearBound      = props.getProperty('CRAWL_YEAR_BOUND')      !== 'false';
+    var backwardDepth  = parseInt(props.getProperty('CRAWL_BACKWARD_DEPTH') || '1') || 1;
     var logRow         = parseInt(props.getProperty('CRAWL_LOG_ROW') || '0') || 0;
 
     var result;
@@ -241,7 +242,7 @@ function crawlBatchTrigger() {
     // ── Backward phase ────────────────────────────────────────
     } else if (phase === 'backward') {
       setCrawlStatus(sheet, 'Backward pass — batch ' + batch + '…');
-      result = runBackwardPass(sheet, groups, maxDepth, maxPapers, expandBackward, matchesOnly, yearFloor, yearBound);
+      result = runBackwardPass(sheet, groups, backwardDepth, maxPapers, expandBackward, matchesOnly, yearFloor, yearBound);
 
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL_BATCH_NUM', String(batch + 1));
@@ -947,7 +948,15 @@ function s2GetReferences(paperSheetId) {
 // When expandBackward=true those papers get Crawled=FALSE so the forward loop
 // will later fetch their citations.  Batches against CRAWL_TIME_LIMIT_MS and
 // persists progress in CRAWL_BACKWARD_IDX between trigger invocations.
-function runBackwardPass(sheet, groups, maxDepth, maxPapers, expandBackward, matchesOnly, yearFloor, yearBound) {
+//
+// backwardDepth bounds this independently of (and typically much smaller
+// than) the forward maxDepth. Without it, every new row this pass writes
+// gets appended to the same sheet it re-scans every batch, so anything
+// below the forward maxDepth stays eligible to have ITS references looked
+// up too — turning "one supplementary backward hop" into a second
+// full-depth crawl that recursively snowballs for as long as it keeps
+// finding new candidates.
+function runBackwardPass(sheet, groups, backwardDepth, maxPapers, expandBackward, matchesOnly, yearFloor, yearBound) {
   matchesOnly = matchesOnly !== false;
   var startTime = Date.now();
   var props     = PropertiesService.getScriptProperties();
@@ -964,7 +973,8 @@ function runBackwardPass(sheet, groups, maxDepth, maxPapers, expandBackward, mat
   // skipped, so the index into paperIds doesn't line up with row number).
   // paperDepths tracks each ID's own Depth, so newly-discovered references
   // inherit "parent depth + 1" instead of always resetting to 0 — otherwise
-  // maxDepth stops bounding anything once backward discovery kicks in.
+  // backwardDepth (below) stops bounding anything once backward discovery
+  // kicks in.
   var allIds         = new Set();
   var paperIds        = [];
   var paperSheetRows  = [];
@@ -994,10 +1004,10 @@ function runBackwardPass(sheet, groups, maxDepth, maxPapers, expandBackward, mat
     var paperId        = paperIds[idx++];
     processed++;
 
-    // Same bound as the forward loop: once a paper's own depth reaches
-    // maxDepth, don't explore further from it — its references would only
-    // ever land at paperDepth + 1, i.e. past the configured limit.
-    if (paperDepth >= maxDepth) continue;
+    // Once a paper's own depth reaches backwardDepth, don't explore further
+    // from it — this is the cap that keeps the backward pass to a bounded
+    // number of hops instead of recursively following every paper it finds.
+    if (paperDepth >= backwardDepth) continue;
 
     Utilities.sleep(1100);
 
@@ -1051,6 +1061,13 @@ function startCrawl(seeds, direction, maxDepth, maxPapers, groups, crawlName, op
     var expandBackward = !!opts.expandBackward;
     var matchesOnly    = opts.matchesOnly !== false;
     var yearBound      = opts.yearBound   !== false;
+    // Independent from (and typically much smaller than) the forward maxDepth
+    // above — bounds how many hops of reference-lookups the backward pass
+    // itself recursively follows, so it can't turn into a second full-depth
+    // crawl (runBackwardPass rebuilds its candidate queue from the whole
+    // sheet every batch, so anything it finds is otherwise eligible to have
+    // its own references looked up too).
+    var backwardDepth  = parseInt(opts.backwardDepth) || 1;
 
     // Floor = earliest seed year — bounds the corpus to [seed years, present
     // day] by default, so backward-discovered references don't wander
@@ -1081,6 +1098,7 @@ function startCrawl(seeds, direction, maxDepth, maxPapers, groups, crawlName, op
     props.setProperty('CRAWL_MATCHES_ONLY',     matchesOnly    ? 'true' : 'false');
     props.setProperty('CRAWL_YEAR_BOUND',       yearBound      ? 'true' : 'false');
     props.setProperty('CRAWL_YEAR_FLOOR',       String(yearFloor));
+    props.setProperty('CRAWL_BACKWARD_DEPTH',   String(backwardDepth));
     // These are script-wide properties, not scoped to a single crawl sheet —
     // without resetting them here, a fresh crawl can inherit 'true' left
     // over from a previous crawl's backward-expansion phase, mislabeling

@@ -397,7 +397,21 @@ function setupCrawlSheet(sheet, direction, seedTitle) {
     .setBackground("#b7e1cd")
     .setRanges([cfRange])
     .build();
-  sheet.setConditionalFormatRules([cfRule]);
+
+  // CF rule: tint just the Abstract cell when it's blank — a missing
+  // abstract means matching fell back to title text alone, so a "no match"
+  // here is less certain than for a row with a full abstract. Formatting
+  // only (no inserted text), so it can't itself be picked up by the term
+  // search the way an inline marker in a searched column would be.
+  var absLetter  = colToLetter(CRAWL_COL.ABSTRACT);
+  var absRange   = sheet.getRange(3, CRAWL_COL.ABSTRACT, maxRows - 2, 1);
+  var noAbsRule  = SpreadsheetApp.newConditionalFormatRule()
+    .whenFormulaSatisfied("=$" + absLetter + "3=\"\"")
+    .setBackground("#fff3cd")
+    .setRanges([absRange])
+    .build();
+
+  sheet.setConditionalFormatRules([cfRule, noAbsRule]);
 }
 
 // ============================================================
@@ -467,13 +481,38 @@ function writeCrawlRows(sheet, rows) {
 // Row builders
 // ============================================================
 
+// Flags likely parsing artifacts in backward-pass reference metadata (e.g.
+// truncated citation fragments like ": The", "Beyond the", "Et al", or
+// mixed-script noise) rather than genuine papers. Deliberately requires
+// ALL of: no abstract, no authors, AND a title pattern typical of a
+// truncated/malformed entry — a short title alone isn't enough, since
+// real seminal papers can have very short titles ("Scratch",
+// "Computational thinking", both genuine papers seen in this exact
+// dataset) with no other signal that they're bogus.
+function looksLikeMalformedReference(title, abstract, authors) {
+  if (abstract || authors) return false;
+  var t = (title || '').trim();
+  if (!t) return true;
+  if (/^[^a-zA-Z0-9]/.test(t)) return true; // starts with punctuation, e.g. ": The"
+  var words = t.toLowerCase().replace(/[.,;:]+$/, '').split(/\s+/);
+  var lastWord = words[words.length - 1];
+  var trailingStopwords = ['the', 'a', 'an', 'of', 'in', 'to', 'and', 'or', 'al', 'et'];
+  if (trailingStopwords.indexOf(lastWord) !== -1) return true; // trailing fragment / "et al"
+  if (/[一-鿿぀-ヿ가-힯]/.test(t)) return true; // CJK/Hangul mixed in
+  return false;
+}
+
 function crawlRowFromS2(paper, depth, parentId, dir) {
   var mag = paper.externalIds && paper.externalIds.MAG;
-  var id  = mag ? ("W" + mag) : ("S2:" + paper.paperId);
+  var id    = mag ? ("W" + mag) : ("S2:" + paper.paperId);
+  var title = paper.title || "";
+  if (looksLikeMalformedReference(title, paper.abstract, (paper.authors || []).length)) {
+    title = '⚠ [unverified reference — check source] ' + title;
+  }
   return [
     depth, false,
     paper.year || "",
-    paper.title || "",
+    title,
     (paper.authors || []).map(function(a) { return a.name; }).join("; "),
     (paper.publicationTypes || []).join(", "),
     paper.venue || "",
@@ -506,10 +545,14 @@ function crawlRowFromOpenAlex(work, depth, parentId, dir) {
   var abstract = reconstructAbstract(work.abstract_inverted_index);
   var venue    = (work.primary_location && work.primary_location.source)
                    ? work.primary_location.source.display_name : "";
+  var title    = work.title || "";
+  if (looksLikeMalformedReference(title, abstract, (work.authorships || []).length)) {
+    title = '⚠ [unverified reference — check source] ' + title;
+  }
   return [
     depth, false,
     work.publication_year || "",
-    work.title || "",
+    title,
     (work.authorships || []).map(function(a) { return a.author.display_name; }).join("; "),
     "",
     venue,
@@ -527,8 +570,8 @@ function crawlRowFromOpenAlex(work, depth, parentId, dir) {
 // JS filter — mirrors the Sheets formula logic
 // ============================================================
 
-function jsMatchesFilter(abstract, groups) {
-  var text = (abstract || "").toLowerCase();
+function jsMatchesFilter(text, groups) {
+  text = (text || "").toLowerCase();
   return groups.every(function(group) {
     if (!group.terms || !group.terms.trim()) return true;
     var terms = group.terms.split(",")
@@ -695,7 +738,8 @@ function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, m
       var c   = candidates[i];
       var cId = getCandidateId(c, direction);
       if (existingIds.has(cId)) continue;
-      var isMatch = jsMatchesFilter(getCandidateAbstract(c, direction), groups) &&
+      var candidateText = (c.title || '') + ' ' + getCandidateAbstract(c, direction);
+      var isMatch = jsMatchesFilter(candidateText, groups) &&
                     isYearInBounds(getCandidateYear(c, direction), yearFloor, yearBound);
       if (!isMatch && matchesOnly) continue;
       var row = buildCrawlRow(c, direction, depth + 1, id, paperDir);
@@ -1023,7 +1067,8 @@ function runBackwardPass(sheet, groups, backwardDepth, maxPapers, expandBackward
       var mag   = ref.externalIds && ref.externalIds.MAG;
       var refId = mag ? ('W' + mag) : ('S2:' + ref.paperId);
       if (allIds.has(refId)) return;
-      var isMatch = jsMatchesFilter(ref.abstract || '', groups) &&
+      var refText = (ref.title || '') + ' ' + (ref.abstract || '');
+      var isMatch = jsMatchesFilter(refText, groups) &&
                     isYearInBounds(ref.year, yearFloor, yearBound);
       if (!isMatch && matchesOnly) return;
       allIds.add(refId);
@@ -1276,7 +1321,7 @@ function applyCrawlHighlight(sheet, groups) {
 
     g.terms.forEach(function(term) {
       sheet.getRange(2, colNum)
-        .setFormula(buildTermFormula(term, CRAWL_COL.ABSTRACT))
+        .setFormula(buildTermFormula(term, CRAWL_COL.TITLE, CRAWL_COL.ABSTRACT))
         .setFontWeight('bold')
         .setHorizontalAlignment('center')
         .setVerticalAlignment('bottom')

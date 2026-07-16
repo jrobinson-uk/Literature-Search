@@ -98,15 +98,19 @@ function buildFilterMatchFromTermCols(parsedGroups, firstDetailColNum) {
          'IF(a="",' + '"",' + andExpr + '))))';
 }
 
-// Builds a MAP formula for a single term that returns TRUE/FALSE per data row.
+// Builds a MAP formula for a single term that returns TRUE/FALSE per data row,
+// searching across title and abstract together (title alone stands in when
+// the abstract is missing — a common gap, not a parsing bug — and cheaply
+// catches title-only matches even when the abstract is present).
 // Header row (ROW=2) returns the term string itself as the column label.
-function buildTermFormula(term, abstractColNum) {
-  const absLetter = colToLetter(abstractColNum);
-  const safeTerm  = term.replace(/"/g, '""');
-  return '=MAP(A2:A,' + absLetter + '2:' + absLetter + ',LAMBDA(a,k,' +
+function buildTermFormula(term, titleColNum, abstractColNum) {
+  const titleLetter = colToLetter(titleColNum);
+  const absLetter   = colToLetter(abstractColNum);
+  const safeTerm    = term.replace(/"/g, '""');
+  return '=MAP(A2:A,' + titleLetter + '2:' + titleLetter + ',' + absLetter + '2:' + absLetter + ',LAMBDA(a,t,k,' +
          'IF(ROW(a)=2,"' + safeTerm + '",' +
          'IF(a="","",' +
-         'ISNUMBER(SEARCH("' + safeTerm + '",k))' +
+         'ISNUMBER(SEARCH("' + safeTerm + '",t&" "&k))' +
          '))))';
 }
 
@@ -583,7 +587,7 @@ function applySnowballFilter(groups, direction) {
 
       g.terms.forEach(function(term) {
         sheet.getRange(2, colNum)
-          .setFormula(buildTermFormula(term, COL.ABSTRACT))
+          .setFormula(buildTermFormula(term, COL.TITLE, COL.ABSTRACT))
           .setFontWeight('bold')
           .setHorizontalAlignment('center')
           .setVerticalAlignment('bottom')

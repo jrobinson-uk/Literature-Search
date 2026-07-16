@@ -493,7 +493,11 @@ function looksLikeMalformedReference(title, abstract, authors) {
   if (abstract || authors) return false;
   var t = (title || '').trim();
   if (!t) return true;
-  if (/^[^a-zA-Z0-9]/.test(t)) return true; // starts with punctuation, e.g. ": The"
+  // Starts with punctuation, e.g. ": The" — but quote marks are excluded,
+  // since plenty of real titles legitimately open by quoting a phrase
+  // (confirmed false positive: a real book review titled
+  // "“Got TPACK?” If not, Here’s Where to Learn about It!").
+  if (/^[^a-zA-Z0-9'"‘’“”«»]/.test(t)) return true;
   var words = t.toLowerCase().replace(/[.,;:]+$/, '').split(/\s+/);
   var lastWord = words[words.length - 1];
   var trailingStopwords = ['the', 'a', 'an', 'of', 'in', 'to', 'and', 'or', 'al', 'et'];

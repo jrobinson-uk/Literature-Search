@@ -776,25 +776,22 @@ function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, m
       var c   = candidates[i];
       var cId = getCandidateId(c, direction);
       if (existingIds.has(cId)) continue;
-      var abstract  = getCandidateAbstract(c, direction);
-      var yearOk    = isYearInBounds(getCandidateYear(c, direction), yearFloor, yearBound);
-      var textMatch = jsMatchesFilter((c.title || '') + ' ' + abstract, groups);
+      var abstract = getCandidateAbstract(c, direction);
 
-      // Only worth the extra call where it could actually change the
-      // outcome: no abstract to check against, title alone didn't match,
-      // and the year is fine (so a recovered abstract wouldn't be wasted
-      // on a candidate that's excluded anyway). Forward-only — the
-      // OpenAlex candidate path is unused by the current UI.
-      if (!textMatch && !abstract && yearOk && direction === "forward") {
+      // Try to recover any missing abstract from OpenAlex, regardless of
+      // whether it would change the match outcome — the goal is minimising
+      // gaps in the sheet's own data, not just correcting matches.
+      // Forward-only: the OpenAlex candidate path is unused by the current UI.
+      if (!abstract && direction === "forward") {
         var enriched = fetchOpenAlexAbstract(c.externalIds);
         if (enriched) {
           abstract   = enriched;
           c.abstract = enriched; // so the written row reflects the recovered text
-          textMatch  = jsMatchesFilter((c.title || '') + ' ' + abstract, groups);
         }
       }
 
-      var isMatch = textMatch && yearOk;
+      var yearOk  = isYearInBounds(getCandidateYear(c, direction), yearFloor, yearBound);
+      var isMatch = jsMatchesFilter((c.title || '') + ' ' + abstract, groups) && yearOk;
       if (!isMatch && matchesOnly) continue;
       var row = buildCrawlRow(c, direction, depth + 1, id, paperDir);
       if (!isMatch) row[CRAWL_COL.CRAWLED - 1] = true;
@@ -1121,20 +1118,16 @@ function runBackwardPass(sheet, groups, backwardDepth, maxPapers, expandBackward
       var mag   = ref.externalIds && ref.externalIds.MAG;
       var refId = mag ? ('W' + mag) : ('S2:' + ref.paperId);
       if (allIds.has(refId)) return;
-      var yearOk    = isYearInBounds(ref.year, yearFloor, yearBound);
-      var textMatch = jsMatchesFilter((ref.title || '') + ' ' + (ref.abstract || ''), groups);
-
-      // Same fallback as the forward loop — only when it could change the
-      // outcome (no abstract, title alone didn't match, year is fine).
-      if (!textMatch && !ref.abstract && yearOk) {
+      // Same fallback as the forward loop — try to recover any missing
+      // abstract from OpenAlex regardless of whether it would change the
+      // match outcome, to minimise gaps in the sheet's own data.
+      if (!ref.abstract) {
         var enrichedRef = fetchOpenAlexAbstract(ref.externalIds);
-        if (enrichedRef) {
-          ref.abstract = enrichedRef;
-          textMatch    = jsMatchesFilter((ref.title || '') + ' ' + ref.abstract, groups);
-        }
+        if (enrichedRef) ref.abstract = enrichedRef;
       }
 
-      var isMatch = textMatch && yearOk;
+      var yearOk  = isYearInBounds(ref.year, yearFloor, yearBound);
+      var isMatch = jsMatchesFilter((ref.title || '') + ' ' + (ref.abstract || ''), groups) && yearOk;
       if (!isMatch && matchesOnly) return;
       allIds.add(refId);
       var row = crawlRowFromS2(ref, paperDepth + 1, paperId, 'B');

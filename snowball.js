@@ -102,15 +102,21 @@ function buildFilterMatchFromTermCols(parsedGroups, firstDetailColNum) {
 // searching across title and abstract together (title alone stands in when
 // the abstract is missing — a common gap, not a parsing bug — and cheaply
 // catches title-only matches even when the abstract is present).
+// Uses REGEXMATCH with \b word boundaries rather than SEARCH's plain
+// substring match, so a short term like "AI" or "ML" doesn't match inside
+// unrelated words ("said", "html") — mirrors jsMatchesFilter in crawl.js.
 // Header row (ROW=2) returns the term string itself as the column label.
 function buildTermFormula(term, titleColNum, abstractColNum) {
   const titleLetter = colToLetter(titleColNum);
   const absLetter   = colToLetter(abstractColNum);
-  const safeTerm    = term.replace(/"/g, '""');
+  const safeTerm    = term.replace(/"/g, '""'); // for the header label (row 2)
+  const regexTerm   = term.toLowerCase()
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&') // escape regex metacharacters
+    .replace(/"/g, '""');                    // escape quotes for the formula string literal
   return '=MAP(A2:A,' + titleLetter + '2:' + titleLetter + ',' + absLetter + '2:' + absLetter + ',LAMBDA(a,t,k,' +
          'IF(ROW(a)=2,"' + safeTerm + '",' +
          'IF(a="","",' +
-         'ISNUMBER(SEARCH("' + safeTerm + '",t&" "&k))' +
+         'REGEXMATCH(LOWER(t&" "&k),"\\b' + regexTerm + '\\b")' +
          '))))';
 }
 

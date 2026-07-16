@@ -574,6 +574,12 @@ function crawlRowFromOpenAlex(work, depth, parentId, dir) {
 // JS filter — mirrors the Sheets formula logic
 // ============================================================
 
+// Escapes regex metacharacters so a filter term can be dropped into a
+// RegExp/REGEXMATCH pattern literally.
+function escapeRegExpTerm(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function jsMatchesFilter(text, groups) {
   text = (text || "").toLowerCase();
   return groups.every(function(group) {
@@ -582,7 +588,11 @@ function jsMatchesFilter(text, groups) {
       .map(function(t) { return t.trim().replace(/^["']|["']$/g, "").trim().toLowerCase(); })
       .filter(function(t) { return t.length > 0; });
     if (terms.length === 0) return true;
-    var anyMatch = terms.some(function(t) { return text.indexOf(t) !== -1; });
+    // Word-boundary match, not substring — a bare term like "AI" or "ML"
+    // would otherwise match inside unrelated words ("said", "html").
+    var anyMatch = terms.some(function(t) {
+      return new RegExp('\\b' + escapeRegExpTerm(t) + '\\b', 'i').test(text);
+    });
     return group.not ? !anyMatch : anyMatch;
   });
 }
@@ -596,13 +606,20 @@ function fetchForwardCandidates(id, title) {
   return s2GetCitations(id, title);
 }
 
+// Back-off delays (ms) applied on transient OpenAlex failures (429 or 5xx).
+// Shorter than S2's own [3000,10000,30000] since OpenAlex's polite pool
+// (mailto set) is generally more permissive.
+const OPENALEX_BACKOFF_MS = [1000, 3000, 8000];
+
 // Best-effort fallback: recovers an abstract from OpenAlex when Semantic
 // Scholar didn't have one, using whichever external ID is available (MAG,
-// then DOI). Single attempt, no retries — this is an enrichment, not a
-// critical-path fetch, so a transient OpenAlex hiccup should just leave the
-// candidate as "no abstract" rather than slow the crawl down further.
-// Returns "" (not found, no usable ID, or any error) so callers can treat
-// it the same as "still no abstract".
+// then DOI). Retries on rate-limit/server errors with back-off — confirmed
+// cases where OpenAlex genuinely has the abstract but a single attempt came
+// back empty, so this is worth persisting on rather than giving up at once.
+// Gives up immediately on a non-retryable response (e.g. 404 — retrying
+// won't produce a paper that doesn't exist under that ID).
+// Returns "" (not found, no usable ID, or retries exhausted) so callers can
+// treat it the same as "still no abstract".
 function fetchOpenAlexAbstract(externalIds) {
   if (!externalIds) return "";
   var url = null;
@@ -615,19 +632,36 @@ function fetchOpenAlexAbstract(externalIds) {
           "?select=abstract_inverted_index&mailto=" + getOpenAlexEmail();
   }
   if (!url) return "";
-  try {
-    var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-    // Brief pacing after every attempt (success or not) — a paper with many
-    // missing-abstract references could otherwise fire several of these
-    // back-to-back with no spacing at all, unlike the once-per-source-paper
-    // sleep already covering the main S2 fetch.
-    Utilities.sleep(300);
-    if (resp.getResponseCode() !== 200) return "";
-    var data = JSON.parse(resp.getContentText());
-    return reconstructAbstract(data.abstract_inverted_index);
-  } catch (e) {
-    return "";
+
+  var result = "";
+  for (var attempt = 0; attempt <= OPENALEX_BACKOFF_MS.length; attempt++) {
+    try {
+      var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+      var code = resp.getResponseCode();
+      if (code === 200) {
+        var data = JSON.parse(resp.getContentText());
+        result = reconstructAbstract(data.abstract_inverted_index);
+        break;
+      }
+      if ((code === 429 || code >= 500) && attempt < OPENALEX_BACKOFF_MS.length) {
+        Utilities.sleep(OPENALEX_BACKOFF_MS[attempt]);
+        continue;
+      }
+      break; // non-retryable (e.g. 404), or retries exhausted
+    } catch (e) {
+      if (attempt < OPENALEX_BACKOFF_MS.length) {
+        Utilities.sleep(OPENALEX_BACKOFF_MS[attempt]);
+        continue;
+      }
+      break;
+    }
   }
+  // Brief pacing once settled (success or not) — a paper with many
+  // missing-abstract references could otherwise fire several of these
+  // back-to-back with no spacing at all, unlike the once-per-source-paper
+  // sleep already covering the main S2 fetch.
+  Utilities.sleep(300);
+  return result;
 }
 
 // Backward: papers that the given paper cites (OpenAlex referenced_works + batch metadata)

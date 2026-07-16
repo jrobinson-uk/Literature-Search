@@ -592,6 +592,40 @@ function fetchForwardCandidates(id, title) {
   return s2GetCitations(id, title);
 }
 
+// Best-effort fallback: recovers an abstract from OpenAlex when Semantic
+// Scholar didn't have one, using whichever external ID is available (MAG,
+// then DOI). Single attempt, no retries — this is an enrichment, not a
+// critical-path fetch, so a transient OpenAlex hiccup should just leave the
+// candidate as "no abstract" rather than slow the crawl down further.
+// Returns "" (not found, no usable ID, or any error) so callers can treat
+// it the same as "still no abstract".
+function fetchOpenAlexAbstract(externalIds) {
+  if (!externalIds) return "";
+  var url = null;
+  if (externalIds.MAG) {
+    url = "https://api.openalex.org/works/W" + externalIds.MAG +
+          "?select=abstract_inverted_index&mailto=" + getOpenAlexEmail();
+  } else if (externalIds.DOI) {
+    url = "https://api.openalex.org/works/https://doi.org/" +
+          encodeURIComponent(externalIds.DOI) +
+          "?select=abstract_inverted_index&mailto=" + getOpenAlexEmail();
+  }
+  if (!url) return "";
+  try {
+    var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    // Brief pacing after every attempt (success or not) — a paper with many
+    // missing-abstract references could otherwise fire several of these
+    // back-to-back with no spacing at all, unlike the once-per-source-paper
+    // sleep already covering the main S2 fetch.
+    Utilities.sleep(300);
+    if (resp.getResponseCode() !== 200) return "";
+    var data = JSON.parse(resp.getContentText());
+    return reconstructAbstract(data.abstract_inverted_index);
+  } catch (e) {
+    return "";
+  }
+}
+
 // Backward: papers that the given paper cites (OpenAlex referenced_works + batch metadata)
 function fetchBackwardCandidates(openAlexId) {
   var url  = "https://api.openalex.org/works/" + openAlexId +
@@ -738,9 +772,25 @@ function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, m
       var c   = candidates[i];
       var cId = getCandidateId(c, direction);
       if (existingIds.has(cId)) continue;
-      var candidateText = (c.title || '') + ' ' + getCandidateAbstract(c, direction);
-      var isMatch = jsMatchesFilter(candidateText, groups) &&
-                    isYearInBounds(getCandidateYear(c, direction), yearFloor, yearBound);
+      var abstract  = getCandidateAbstract(c, direction);
+      var yearOk    = isYearInBounds(getCandidateYear(c, direction), yearFloor, yearBound);
+      var textMatch = jsMatchesFilter((c.title || '') + ' ' + abstract, groups);
+
+      // Only worth the extra call where it could actually change the
+      // outcome: no abstract to check against, title alone didn't match,
+      // and the year is fine (so a recovered abstract wouldn't be wasted
+      // on a candidate that's excluded anyway). Forward-only — the
+      // OpenAlex candidate path is unused by the current UI.
+      if (!textMatch && !abstract && yearOk && direction === "forward") {
+        var enriched = fetchOpenAlexAbstract(c.externalIds);
+        if (enriched) {
+          abstract   = enriched;
+          c.abstract = enriched; // so the written row reflects the recovered text
+          textMatch  = jsMatchesFilter((c.title || '') + ' ' + abstract, groups);
+        }
+      }
+
+      var isMatch = textMatch && yearOk;
       if (!isMatch && matchesOnly) continue;
       var row = buildCrawlRow(c, direction, depth + 1, id, paperDir);
       if (!isMatch) row[CRAWL_COL.CRAWLED - 1] = true;
@@ -1067,9 +1117,20 @@ function runBackwardPass(sheet, groups, backwardDepth, maxPapers, expandBackward
       var mag   = ref.externalIds && ref.externalIds.MAG;
       var refId = mag ? ('W' + mag) : ('S2:' + ref.paperId);
       if (allIds.has(refId)) return;
-      var refText = (ref.title || '') + ' ' + (ref.abstract || '');
-      var isMatch = jsMatchesFilter(refText, groups) &&
-                    isYearInBounds(ref.year, yearFloor, yearBound);
+      var yearOk    = isYearInBounds(ref.year, yearFloor, yearBound);
+      var textMatch = jsMatchesFilter((ref.title || '') + ' ' + (ref.abstract || ''), groups);
+
+      // Same fallback as the forward loop — only when it could change the
+      // outcome (no abstract, title alone didn't match, year is fine).
+      if (!textMatch && !ref.abstract && yearOk) {
+        var enrichedRef = fetchOpenAlexAbstract(ref.externalIds);
+        if (enrichedRef) {
+          ref.abstract = enrichedRef;
+          textMatch    = jsMatchesFilter((ref.title || '') + ' ' + ref.abstract, groups);
+        }
+      }
+
+      var isMatch = textMatch && yearOk;
       if (!isMatch && matchesOnly) return;
       allIds.add(refId);
       var row = crawlRowFromS2(ref, paperDepth + 1, paperId, 'B');

@@ -17,13 +17,15 @@ const LOG_EXT = {
   FILTER_GROUPS: 22,  // JSON filter groups
   BACKWARD_PASS: 23,  // None | Backward | Backward + Expand
   STATUS:        24,  // Running | Complete | Error | Paper Limit
-  RESUME_CODE:   25   // JSON blob — paste into crawl panel to reload settings
+  RESUME_CODE:   25,  // JSON blob — paste into crawl panel to reload settings
+  COMPLETED_AT:  26   // set whenever status reaches a terminal state — see isTerminalStatus_
 };
 
+// Column 1 (TimeStamp, set in appendLogRow) already serves as "started at".
 const LOG_EXT_HEADERS = [
   'Type', 'Name / Sheet', 'Seeds',
   'Depth', 'Max Papers', 'Filter Groups',
-  'Backward Pass', 'Status', 'Resume Code'
+  'Backward Pass', 'Status', 'Resume Code', 'Completed At'
 ];
 
 // ============================================================
@@ -45,8 +47,11 @@ function getLogSheet() {
 function ensureLogExtHeaders() {
   var sheet = getLogSheet();
   if (!sheet) return;
-  // Check the last extended column — if it already has the header, all columns are set.
-  if (sheet.getRange(1, LOG_EXT.RESUME_CODE).getValue() === 'Resume Code') return;
+  // Check the last extended column — if it already has the header, all columns
+  // are set. Checking the true last column (not an earlier one, e.g. Resume
+  // Code) matters so a sheet from before a new column was added gets it
+  // backfilled rather than being mistaken for already fully set up.
+  if (sheet.getRange(1, LOG_EXT.COMPLETED_AT).getValue() === 'Completed At') return;
   sheet.getRange(1, LOG_EXT.TYPE, 1, LOG_EXT_HEADERS.length)
     .setValues([LOG_EXT_HEADERS])
     .setFontWeight('bold')
@@ -118,19 +123,36 @@ function appendLogRow(type, data) {
     data.filterGroups ? JSON.stringify(data.filterGroups) : '',
     backwardLabel,
     'Running',
-    resumeCode
+    resumeCode,
+    ''   // Completed At — filled in by updateLogRow once a terminal status is reached
   ]]);
 
   setLogStatusStyle_(sheet, lastRow, 'Running');
   return lastRow;
 }
 
+// True for any status that means the trigger has stopped running — as
+// opposed to "Running" / in-progress batch messages like "batch 3 done,
+// batch 4 starting…". Paper Limit counts as terminal even though it's
+// resumable, since the crawl genuinely stops until a manual Resume.
+function isTerminalStatus_(status) {
+  return status === 'Complete' || status === 'Cancelled' || status === 'Paper Limit' ||
+         status.indexOf('Error') !== -1;
+}
+
 // Updates the Status cell and its colour for a given log row number.
+// Stamps Completed At whenever the status lands on a terminal state —
+// overwritten each time if a resumed run later stops again.
 function updateLogRow(rowNum, status) {
   var sheet = getLogSheet();
   if (!sheet || !rowNum) return;
   sheet.getRange(rowNum, LOG_EXT.STATUS).setValue(status);
   setLogStatusStyle_(sheet, rowNum, status);
+  if (isTerminalStatus_(status)) {
+    var tz = Session.getScriptTimeZone();
+    sheet.getRange(rowNum, LOG_EXT.COMPLETED_AT)
+      .setValue(Utilities.formatDate(new Date(), tz, 'dd/MM/yyyy HH:mm:ss'));
+  }
 }
 
 function setLogStatusStyle_(sheet, rowNum, status) {

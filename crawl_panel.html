@@ -233,8 +233,20 @@
             <label for="matchesOnlyCheck">Only log matching papers</label>
           </div>
           <div class="check-row">
-            <input type="checkbox" id="yearBoundCheck" checked>
+            <input type="checkbox" id="yearBoundCheck" checked onchange="toggleYearRange()">
             <label for="yearBoundCheck">Bound corpus by seed year → present day</label>
+          </div>
+          <div class="check-sub" id="yearRangeRow">
+            <div class="limits-row">
+              <div>
+                <label>From year (optional)</label>
+                <input type="number" id="crawlYearFrom" placeholder="earliest seed">
+              </div>
+              <div>
+                <label>To year (optional)</label>
+                <input type="number" id="crawlYearTo" placeholder="present day">
+              </div>
+            </div>
           </div>
           <div class="check-row">
             <input type="checkbox" id="runBackwardCheck" onchange="toggleExpandOption()">
@@ -260,9 +272,11 @@
         </p>
         <p class="hint">
           "Bound corpus by seed year → present day" keeps backward-pass references from wandering
-          arbitrarily far into the past — anything older than your earliest seed (or dated in the
-          future) is treated the same as a non-match: logged if "Only log matching papers" is off,
-          but never scraped for its own references or citations.
+          arbitrarily far into the past — anything outside the range is treated the same as a
+          non-match: logged if "Only log matching papers" is off, but never scraped for its own
+          references or citations. Leave From/To blank to use the defaults (earliest seed year and
+          present day), or set either to override — e.g. to search a specific date range regardless
+          of your seeds' own years.
         </p>
         <p class="hint">
           "Backward depth" caps how many additional hops of reference-lookups the backward pass runs,
@@ -616,6 +630,12 @@
                   seeds.length + ' total seed' + (seeds.length === 1 ? '' : 's') + '.');
       }
 
+      // ── Year bound toggle ──────────────────────────────────────
+      function toggleYearRange() {
+        var show = document.getElementById('yearBoundCheck').checked;
+        document.getElementById('yearRangeRow').style.display = show ? 'block' : 'none';
+      }
+
       // ── Backward pass toggle ──────────────────────────────────
       function toggleExpandOption() {
         var show = document.getElementById('runBackwardCheck').checked;
@@ -635,10 +655,16 @@
         var expandBackward = document.getElementById('expandBackwardCheck').checked;
         var matchesOnly    = document.getElementById('matchesOnlyCheck').checked;
         var yearBound      = document.getElementById('yearBoundCheck').checked;
+        var yearFrom       = parseInt(document.getElementById('crawlYearFrom').value) || 0;
+        var yearTo         = parseInt(document.getElementById('crawlYearTo').value)   || 0;
         var backwardDepth  = parseInt(document.getElementById('crawlBackwardDepth').value) || 1;
 
         if (!crawlName)          { setStatus('Please enter a name for this crawl.'); return; }
         if (groups.length === 0) { setStatus('Please add at least one filter group.'); return; }
+        if (yearFrom && yearTo && yearFrom > yearTo) {
+          setStatus('"From year" must be less than or equal to "To year".');
+          return;
+        }
 
         setLoading(true);
         setStatus('Starting crawl — running in background. Watch the Crawl Status cell on the sheet.');
@@ -647,7 +673,7 @@
           .withFailureHandler(function(err) { setStatus('Error: ' + err.message); setLoading(false); })
           .startCrawl(seeds, 'forward', maxDepth, maxPapers, groups, crawlName,
                       { runBackward: runBackward, expandBackward: expandBackward, matchesOnly: matchesOnly,
-                        yearBound: yearBound, backwardDepth: backwardDepth });
+                        yearBound: yearBound, yearFrom: yearFrom, yearTo: yearTo, backwardDepth: backwardDepth });
       }
 
       function resumeCrawl() {

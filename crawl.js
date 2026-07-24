@@ -204,7 +204,8 @@ function crawlBatchTrigger() {
     var runBackward    = props.getProperty('CRAWL_RUN_BACKWARD')    === 'true';
     var expandBackward = props.getProperty('CRAWL_EXPAND_BACKWARD') === 'true';
     var matchesOnly    = props.getProperty('CRAWL_MATCHES_ONLY')    !== 'false';
-    var yearFloor      = parseInt(props.getProperty('CRAWL_YEAR_FLOOR') || '0') || 0;
+    var yearFloor      = parseInt(props.getProperty('CRAWL_YEAR_FLOOR')   || '0') || 0;
+    var yearCeiling    = parseInt(props.getProperty('CRAWL_YEAR_CEILING') || '0') || 0;
     var yearBound      = props.getProperty('CRAWL_YEAR_BOUND')      !== 'false';
     var backwardDepth  = parseInt(props.getProperty('CRAWL_BACKWARD_DEPTH') || '1') || 1;
     var logRow         = parseInt(props.getProperty('CRAWL_LOG_ROW') || '0') || 0;
@@ -223,7 +224,7 @@ function crawlBatchTrigger() {
       }
 
       setCrawlStatus(sheet, phaseLabel + ' — batch ' + batch + '…');
-      result = runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, matchesOnly, yearFloor, yearBound);
+      result = runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, matchesOnly, yearFloor, yearCeiling, yearBound);
 
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL_BATCH_NUM', String(batch + 1));
@@ -242,7 +243,7 @@ function crawlBatchTrigger() {
     // ── Backward phase ────────────────────────────────────────
     } else if (phase === 'backward') {
       setCrawlStatus(sheet, 'Backward pass — batch ' + batch + '…');
-      result = runBackwardPass(sheet, groups, backwardDepth, maxPapers, expandBackward, matchesOnly, yearFloor, yearBound);
+      result = runBackwardPass(sheet, groups, backwardDepth, maxPapers, expandBackward, matchesOnly, yearFloor, yearCeiling, yearBound);
 
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL_BATCH_NUM', String(batch + 1));
@@ -753,14 +754,17 @@ function getCandidateYear(candidate, direction) {
 
 // True when yearBound is off, the year is missing/unparseable (benefit of
 // the doubt rather than penalising incomplete metadata), or the year falls
-// within [yearFloor, current year]. yearFloor of 0 means "no seed had usable
-// year metadata" — treated as no effective floor.
-function isYearInBounds(year, yearFloor, yearBound) {
+// within [yearFloor, yearCeiling]. yearFloor of 0 means "no seed had usable
+// year metadata, and no explicit From year given" — no effective floor.
+// yearCeiling of 0 means "no explicit To year given" — defaults to the
+// current year rather than being unbounded.
+function isYearInBounds(year, yearFloor, yearCeiling, yearBound) {
   if (!yearBound) return true;
   var y = parseInt(year);
   if (!y || isNaN(y)) return true;
   if (yearFloor && y < yearFloor) return false;
-  if (y > new Date().getFullYear()) return false;
+  var ceiling = yearCeiling || new Date().getFullYear();
+  if (y > ceiling) return false;
   return true;
 }
 
@@ -798,7 +802,7 @@ function markFetchFailure(sheet, sheetRow, e) {
 // (or newer than the current year) are treated as non-matches — logged as a
 // dead end (matchesOnly's existing Crawled=TRUE handling) rather than
 // excluded outright, but never expanded further.
-function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, matchesOnly, yearFloor, yearBound) {
+function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, matchesOnly, yearFloor, yearCeiling, yearBound) {
   paperDir    = paperDir || "F";
   matchesOnly = matchesOnly !== false;
   var startTime = Date.now();
@@ -873,7 +877,7 @@ function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, m
         note = describeAbstractSource(lookup);
       }
 
-      var yearOk  = isYearInBounds(getCandidateYear(c, direction), yearFloor, yearBound);
+      var yearOk  = isYearInBounds(getCandidateYear(c, direction), yearFloor, yearCeiling, yearBound);
       var isMatch = jsMatchesFilter((c.title || '') + ' ' + abstract, groups) && yearOk;
       if (!isMatch && matchesOnly) continue;
       var row = buildCrawlRow(c, direction, depth + 1, id, paperDir);
@@ -1136,7 +1140,7 @@ function s2GetReferences(paperSheetId) {
 // up too — turning "one supplementary backward hop" into a second
 // full-depth crawl that recursively snowballs for as long as it keeps
 // finding new candidates.
-function runBackwardPass(sheet, groups, backwardDepth, maxPapers, expandBackward, matchesOnly, yearFloor, yearBound) {
+function runBackwardPass(sheet, groups, backwardDepth, maxPapers, expandBackward, matchesOnly, yearFloor, yearCeiling, yearBound) {
   matchesOnly = matchesOnly !== false;
   var startTime = Date.now();
   var props     = PropertiesService.getScriptProperties();
@@ -1215,7 +1219,7 @@ function runBackwardPass(sheet, groups, backwardDepth, maxPapers, expandBackward
         note = describeAbstractSource(lookup);
       }
 
-      var yearOk  = isYearInBounds(ref.year, yearFloor, yearBound);
+      var yearOk  = isYearInBounds(ref.year, yearFloor, yearCeiling, yearBound);
       var isMatch = jsMatchesFilter((ref.title || '') + ' ' + (ref.abstract || ''), groups) && yearOk;
       if (!isMatch && matchesOnly) return;
       allIds.add(refId);
@@ -1263,14 +1267,18 @@ function startCrawl(seeds, direction, maxDepth, maxPapers, groups, crawlName, op
     // its own references looked up too).
     var backwardDepth  = parseInt(opts.backwardDepth) || 1;
 
-    // Floor = earliest seed year — bounds the corpus to [seed years, present
-    // day] by default, so backward-discovered references don't wander
-    // arbitrarily far into the past. 0 (no seed has usable year metadata)
-    // means no effective floor.
+    // Floor defaults to the earliest seed year, ceiling to the present day —
+    // bounding the corpus so backward-discovered references don't wander
+    // arbitrarily far into the past. Both can be overridden with an explicit
+    // From/To year from the panel; 0 means "no override, use the default".
     var seedYears = seeds
       .map(function(s) { return parseInt(s.year); })
       .filter(function(y) { return y && !isNaN(y); });
-    var yearFloor = seedYears.length ? Math.min.apply(null, seedYears) : 0;
+    var autoYearFloor = seedYears.length ? Math.min.apply(null, seedYears) : 0;
+    var yearFromOverride = parseInt(opts.yearFrom) || 0;
+    var yearToOverride   = parseInt(opts.yearTo)   || 0;
+    var yearFloor   = yearFromOverride || autoYearFloor;
+    var yearCeiling = yearToOverride; // 0 = no override, isYearInBounds defaults to present day
 
     var sheetName = (crawlName || '').trim() || newCrawlSheetName();
     var seedLabel = seeds.length === 1
@@ -1292,6 +1300,7 @@ function startCrawl(seeds, direction, maxDepth, maxPapers, groups, crawlName, op
     props.setProperty('CRAWL_MATCHES_ONLY',     matchesOnly    ? 'true' : 'false');
     props.setProperty('CRAWL_YEAR_BOUND',       yearBound      ? 'true' : 'false');
     props.setProperty('CRAWL_YEAR_FLOOR',       String(yearFloor));
+    props.setProperty('CRAWL_YEAR_CEILING',     String(yearCeiling));
     props.setProperty('CRAWL_BACKWARD_DEPTH',   String(backwardDepth));
     // These are script-wide properties, not scoped to a single crawl sheet —
     // without resetting them here, a fresh crawl can inherit 'true' left

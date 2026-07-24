@@ -43,11 +43,15 @@ function showSnowballbar() {
     .setWidth(300);
   SpreadsheetApp.getUi().showSidebar(html);
 }
+// A modeless dialog rather than a sidebar — sidebars are hard-capped at
+// 300px by Sheets itself (setWidth() is silently ignored for showSidebar()),
+// so a genuinely wider panel means a floating dialog instead. Modeless, not
+// modal, so it doesn't block interacting with the sheet while a crawl runs.
 function showCrawlbar() {
   const html = HtmlService.createHtmlOutputFromFile('crawl_panel')
-    .setTitle('Citation Crawl')
-    .setWidth(300);
-  SpreadsheetApp.getUi().showSidebar(html);
+    .setWidth(450)
+    .setHeight(700);
+  SpreadsheetApp.getUi().showModelessDialog(html, 'Citation Crawl');
 }
 
 function promptForKey() {

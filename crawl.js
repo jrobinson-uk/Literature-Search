@@ -462,8 +462,12 @@ function countUncrawled(sheet) {
   return vals.filter(function(v) { return v === false; }).length;
 }
 
+// Returns the row number the batch was written at (or null if empty), so
+// callers that need to attach anything post-write (e.g. abstract-source
+// notes) know exactly which rows they ended up as, without recomputing —
+// and possibly drifting from — the same position independently.
 function writeCrawlRows(sheet, rows) {
-  if (rows.length === 0) return;
+  if (rows.length === 0) return null;
   const startRow = getCrawlLastDataRow(sheet) + 1;
   sheet.getRange(startRow, 1, rows.length, CRAWL_NUM_COLS).setValues(rows);
   sheet.getRange(startRow, CRAWL_COL.CRAWLED, rows.length, 1).insertCheckboxes();
@@ -475,6 +479,21 @@ function writeCrawlRows(sheet, rows) {
   sheet.getRange(startRow, CRAWL_COL.TITLE,    rows.length, 1).setFontSize(10);
   sheet.getRange(startRow, CRAWL_COL.AUTHORS,  rows.length, 1).setFontSize(10);
   sheet.getRange(startRow, CRAWL_COL.ABSTRACT, rows.length, 1).setFontSize(8);
+  return startRow;
+}
+
+// Attaches a hover note to the Abstract cell for rows where an
+// abstract-source lookup was attempted — a cell note rather than a new
+// column (which would shift every fixed CRAWL_COL position for any crawl
+// sheet already in progress) or inline text (which would become part of
+// the searched text now that title+abstract are matched together).
+// notes[i] (aligned with the written rows, startRow+i) may be null/empty
+// for rows where no lookup was needed (Semantic Scholar already had it).
+function applyAbstractNotes(sheet, startRow, notes) {
+  if (!startRow) return;
+  for (var i = 0; i < notes.length; i++) {
+    if (notes[i]) sheet.getRange(startRow + i, CRAWL_COL.ABSTRACT).setNote(notes[i]);
+  }
 }
 
 // ============================================================
@@ -618,36 +637,47 @@ const OPENALEX_BACKOFF_MS = [1000, 3000, 8000];
 // back empty, so this is worth persisting on rather than giving up at once.
 // Gives up immediately on a non-retryable response (e.g. 404 — retrying
 // won't produce a paper that doesn't exist under that ID).
-// Returns "" (not found, no usable ID, or retries exhausted) so callers can
-// treat it the same as "still no abstract".
+//
+// Returns { abstract, reason, url } rather than a bare string, so callers
+// can record *why* a paper still has no abstract — distinguishing "never
+// had an ID to check" from "checked, genuinely has none" from "the check
+// itself failed and availability is unconfirmed" — for debugging which
+// remaining gaps are real vs. a search failure worth retrying.
+//   reason: 'no-id' | 'found' | 'no-abstract' | 'error'
+//   url:    the paper's OpenAlex/DOI page (human-viewable), or '' for no-id
 function fetchOpenAlexAbstract(externalIds) {
-  if (!externalIds) return "";
-  var url = null;
-  if (externalIds.MAG) {
-    url = "https://api.openalex.org/works/W" + externalIds.MAG +
-          "?select=abstract_inverted_index&mailto=" + getOpenAlexEmail();
-  } else if (externalIds.DOI) {
-    url = "https://api.openalex.org/works/https://doi.org/" +
-          encodeURIComponent(externalIds.DOI) +
-          "?select=abstract_inverted_index&mailto=" + getOpenAlexEmail();
+  if (!externalIds || (!externalIds.MAG && !externalIds.DOI)) {
+    return { abstract: "", reason: "no-id", url: "" };
   }
-  if (!url) return "";
+  var url, pageUrl;
+  if (externalIds.MAG) {
+    pageUrl = "https://openalex.org/W" + externalIds.MAG;
+    url     = "https://api.openalex.org/works/W" + externalIds.MAG +
+              "?select=abstract_inverted_index&mailto=" + getOpenAlexEmail();
+  } else {
+    pageUrl = "https://doi.org/" + externalIds.DOI;
+    url     = "https://api.openalex.org/works/https://doi.org/" +
+              encodeURIComponent(externalIds.DOI) +
+              "?select=abstract_inverted_index&mailto=" + getOpenAlexEmail();
+  }
 
-  var result = "";
+  var abstract = "";
+  var reason   = "error";
   for (var attempt = 0; attempt <= OPENALEX_BACKOFF_MS.length; attempt++) {
     try {
       var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
       var code = resp.getResponseCode();
       if (code === 200) {
         var data = JSON.parse(resp.getContentText());
-        result = reconstructAbstract(data.abstract_inverted_index);
+        abstract = reconstructAbstract(data.abstract_inverted_index);
+        reason   = abstract ? "found" : "no-abstract";
         break;
       }
       if ((code === 429 || code >= 500) && attempt < OPENALEX_BACKOFF_MS.length) {
         Utilities.sleep(OPENALEX_BACKOFF_MS[attempt]);
         continue;
       }
-      break; // non-retryable (e.g. 404), or retries exhausted
+      break; // non-retryable (e.g. 404), or retries exhausted — reason stays 'error'
     } catch (e) {
       if (attempt < OPENALEX_BACKOFF_MS.length) {
         Utilities.sleep(OPENALEX_BACKOFF_MS[attempt]);
@@ -661,7 +691,23 @@ function fetchOpenAlexAbstract(externalIds) {
   // back-to-back with no spacing at all, unlike the once-per-source-paper
   // sleep already covering the main S2 fetch.
   Utilities.sleep(300);
-  return result;
+  return { abstract: abstract, reason: reason, url: pageUrl };
+}
+
+// Turns a fetchOpenAlexAbstract() result into a human-readable note for the
+// Abstract cell — only called when Semantic Scholar itself had no abstract.
+function describeAbstractSource(lookup) {
+  switch (lookup.reason) {
+    case "no-id":
+      return "No abstract in Semantic Scholar, and no MAG/DOI available to check OpenAlex.";
+    case "found":
+      return "Abstract recovered from OpenAlex: " + lookup.url;
+    case "no-abstract":
+      return "No abstract in Semantic Scholar. Checked OpenAlex (" + lookup.url + ") — also has no abstract.";
+    default: // 'error'
+      return "No abstract in Semantic Scholar. OpenAlex check failed after retries (" +
+             lookup.url + ") — availability unconfirmed, worth rechecking.";
+  }
 }
 
 // Backward: papers that the given paper cites (OpenAlex referenced_works + batch metadata)
@@ -804,24 +850,27 @@ function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, m
     // Filter: not already in sheet; matches are queued for further expansion,
     // non-matches (when matchesOnly is off) are recorded but marked Crawled
     // so they aren't independently expanded.
-    var existingIds = getCrawlExistingIds(sheet);
-    var matchRows   = [];
+    var existingIds   = getCrawlExistingIds(sheet);
+    var matchRows     = [];
+    var abstractNotes = []; // aligned with matchRows — note text or null per row
     for (var i = 0; i < candidates.length; i++) {
       var c   = candidates[i];
       var cId = getCandidateId(c, direction);
       if (existingIds.has(cId)) continue;
       var abstract = getCandidateAbstract(c, direction);
+      var note     = null;
 
       // Try to recover any missing abstract from OpenAlex, regardless of
       // whether it would change the match outcome — the goal is minimising
       // gaps in the sheet's own data, not just correcting matches.
       // Forward-only: the OpenAlex candidate path is unused by the current UI.
       if (!abstract && direction === "forward") {
-        var enriched = fetchOpenAlexAbstract(c.externalIds);
-        if (enriched) {
-          abstract   = enriched;
-          c.abstract = enriched; // so the written row reflects the recovered text
+        var lookup = fetchOpenAlexAbstract(c.externalIds);
+        if (lookup.abstract) {
+          abstract   = lookup.abstract;
+          c.abstract = lookup.abstract; // so the written row reflects the recovered text
         }
+        note = describeAbstractSource(lookup);
       }
 
       var yearOk  = isYearInBounds(getCandidateYear(c, direction), yearFloor, yearBound);
@@ -830,6 +879,7 @@ function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, m
       var row = buildCrawlRow(c, direction, depth + 1, id, paperDir);
       if (!isMatch) row[CRAWL_COL.CRAWLED - 1] = true;
       matchRows.push(row);
+      abstractNotes.push(note);
       existingIds.add(cId); // deduplicate within this batch before writing
     }
 
@@ -837,7 +887,8 @@ function runCrawlLoop(sheet, direction, groups, maxDepth, maxPapers, paperDir, m
     if (matchRows.length > 0) {
       var currentCount = getCrawlLastDataRow(sheet) - 2;
       var canAdd       = Math.max(0, maxPapers - currentCount);
-      writeCrawlRows(sheet, matchRows.slice(0, canAdd));
+      var writeStart   = writeCrawlRows(sheet, matchRows.slice(0, canAdd));
+      applyAbstractNotes(sheet, writeStart, abstractNotes.slice(0, canAdd));
       if (canAdd < matchRows.length) {
         sheet.getRange(sheetRow, CRAWL_COL.CRAWLED).setValue(true);
         processed++;
@@ -1146,18 +1197,22 @@ function runBackwardPass(sheet, groups, backwardDepth, maxPapers, expandBackward
       continue;
     }
 
-    var newRows = [];
+    var newRows      = [];
+    var newRowNotes  = []; // aligned with newRows — note text or null per row
     refs.forEach(function(ref) {
       if (!ref || !ref.paperId) return;
       var mag   = ref.externalIds && ref.externalIds.MAG;
       var refId = mag ? ('W' + mag) : ('S2:' + ref.paperId);
       if (allIds.has(refId)) return;
+      var note = null;
+
       // Same fallback as the forward loop — try to recover any missing
       // abstract from OpenAlex regardless of whether it would change the
       // match outcome, to minimise gaps in the sheet's own data.
       if (!ref.abstract) {
-        var enrichedRef = fetchOpenAlexAbstract(ref.externalIds);
-        if (enrichedRef) ref.abstract = enrichedRef;
+        var lookup = fetchOpenAlexAbstract(ref.externalIds);
+        if (lookup.abstract) ref.abstract = lookup.abstract;
+        note = describeAbstractSource(lookup);
       }
 
       var yearOk  = isYearInBounds(ref.year, yearFloor, yearBound);
@@ -1169,12 +1224,14 @@ function runBackwardPass(sheet, groups, backwardDepth, maxPapers, expandBackward
       // is a non-match recorded only for visibility.
       if (!expandBackward || !isMatch) row[CRAWL_COL.CRAWLED - 1] = true;
       newRows.push(row);
+      newRowNotes.push(note);
     });
 
     if (newRows.length > 0) {
       var currentCount = getCrawlLastDataRow(sheet) - 2;
       var canAdd       = Math.max(0, maxPapers - currentCount);
-      writeCrawlRows(sheet, newRows.slice(0, canAdd));
+      var writeStart   = writeCrawlRows(sheet, newRows.slice(0, canAdd));
+      applyAbstractNotes(sheet, writeStart, newRowNotes.slice(0, canAdd));
     }
   }
 

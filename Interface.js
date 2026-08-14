@@ -12,9 +12,11 @@ function onOpen() {
     .addSeparator()
     .addItem('Snowball Search', 'showSnowballbar')
     .addItem('Citation Crawl', 'showCrawlbar')
+    .addItem('Citation Crawl v2 (Beta)', 'showCrawlV2bar')
     .addSeparator()
     .addItem('Load Selected Log Row', 'resumeFromLog')
     .addItem('Cancel Crawl', 'cancelCrawl')
+    .addItem('Cancel Crawl v2', 'cancelCrawlV2')
     .addSeparator()
     .addItem('Set SerpAPI Key', 'promptForKey')
     .addItem('Set OpenAlex Email', 'promptForOpenAlexEmail')
@@ -52,6 +54,16 @@ function showCrawlbar() {
     .setWidth(450)
     .setHeight(700);
   SpreadsheetApp.getUi().showModelessDialog(html, 'Citation Crawl');
+}
+
+// Parallel v2 pipeline (keyword → backward → forward) — a separate dialog,
+// separate sheet, separate CRAWL2_* script properties and trigger from the
+// v1 Citation Crawl above, so both can run side by side. See crawl_v2.js.
+function showCrawlV2bar() {
+  const html = HtmlService.createHtmlOutputFromFile('crawl_v2_panel')
+    .setWidth(450)
+    .setHeight(700);
+  SpreadsheetApp.getUi().showModelessDialog(html, 'Citation Crawl v2 (Beta)');
 }
 
 function promptForKey() {

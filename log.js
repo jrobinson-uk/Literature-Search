@@ -238,6 +238,26 @@ function resumeFromLog() {
       props.setProperty('CRAWL_LOG_ROW',         String(row));
       canResume = true;
     }
+  } else if (type === 'CrawlV2') {
+    var crawlV2Sheet   = ss.getSheetByName(name);
+    var isIncompleteV2 = crawlV2Sheet && status !== 'Complete' && status.indexOf('Error') === -1;
+
+    if (isIncompleteV2) {
+      // Mirrors the Crawl branch above, but into v2's own CRAWL2_* namespace
+      // — a resumed v2 run must not touch the v1 CRAWL_* properties, so a
+      // v1 crawl running at the same time is unaffected.
+      // Note: yearBound/yearFloor/yearCeiling/targetSeeds/phase aren't part
+      // of the Log sheet's schema, so a resumed run restarts from Phase 1
+      // (keyword) with year-bound defaults rather than exactly where it left
+      // off — same accepted limitation as v1's resumeFromLog.
+      props.setProperty('CRAWL2_ACTIVE_SHEET',  name);
+      props.setProperty('CRAWL2_MAX_DEPTH',     String(depth      || 3));
+      props.setProperty('CRAWL2_MAX_PAPERS',    String(maxPapers  || 300));
+      props.setProperty('CRAWL2_FILTER_GROUPS', JSON.stringify(filterGroups));
+      props.setProperty('CRAWL2_RUN_BACKWARD',  backwardPass !== 'None' ? 'true' : 'false');
+      props.setProperty('CRAWL2_LOG_ROW',       String(row));
+      canResume = true;
+    }
   }
 
   var replay = {
@@ -256,6 +276,7 @@ function resumeFromLog() {
   props.setProperty('LOG_REPLAY', JSON.stringify(replay));
 
   if      (type === 'Crawl')    showCrawlbar();
+  else if (type === 'CrawlV2')  showCrawlV2bar();
   else if (type === 'Snowball') showSnowballbar();
   else                          showSidebar();
 }

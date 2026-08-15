@@ -114,9 +114,47 @@ function cancelCrawlV2() {
 // Sheet setup — reuses v1's layout entirely
 // ============================================================
 
+// Placeholder Filter Match formula for v2 sheets — three-state text
+// ("No Match" until a real filter is applied), replacing setupCrawlSheet's
+// boolean CRAWL_DEFAULT_FILTER_FORMULA placeholder.
+const CRAWL2_DEFAULT_FILTER_FORMULA =
+  '=MAP(A2:A,H2:H,LAMBDA(a,h,IF(ROW(a)=2,"Filter Match",IF(a<>"","No Match",""))))';
+
 function setupCrawlV2Sheet(sheet, seedLabel) {
   setupCrawlSheet(sheet, 'forward', seedLabel); // identical column layout to v1
   sheet.getRange(1, 1).setValue('Pipeline crawl (v2: keyword → backward → forward)');
+
+  // v1's Filter Match column is boolean (TRUE/FALSE); v2's is three-state
+  // text (Full Match / Partial Match / No Match) so a score-demoted
+  // NOT-group hit is visibly distinguished from both a clean match and a
+  // genuine reject, rather than showing FALSE like today's non-matches.
+  // Swap in the text placeholder and replace setupCrawlSheet's
+  // boolean-keyed green row-highlight rule (=$K3=TRUE, which would never
+  // fire again once K holds text) with two text-keyed rules — full green,
+  // partial orange. The no-abstract yellow-tint rule is untouched.
+  sheet.getRange(2, CRAWL_COL.FILTER_MATCH)
+    .setFormula(CRAWL2_DEFAULT_FILTER_FORMULA)
+    .setFontWeight('bold').setBackground('#4285f4').setFontColor('white');
+
+  var maxRows   = sheet.getMaxRows();
+  var fullRange = sheet.getRange(3, 1, maxRows - 2, CRAWL_NUM_COLS);
+  var fullMatchRule = SpreadsheetApp.newConditionalFormatRule()
+    .whenFormulaSatisfied('=$' + CRAWL_FILTER_MATCH_COL_LETTER + '3="Full Match"')
+    .setBackground('#b7e1cd') // same green as v1's clean-match highlight
+    .setRanges([fullRange]).build();
+  var partialMatchRule = SpreadsheetApp.newConditionalFormatRule()
+    .whenFormulaSatisfied('=$' + CRAWL_FILTER_MATCH_COL_LETTER + '3="Partial Match"')
+    .setBackground('#ffe0b2') // orange — score-demoted NOT-group hit, still kept/expanded
+    .setRanges([fullRange]).build();
+
+  var oldBooleanRowFormula = '=$' + CRAWL_FILTER_MATCH_COL_LETTER + '3=TRUE';
+  var keptRules = sheet.getConditionalFormatRules().filter(function(rule) {
+    var bc = rule.getBooleanCondition();
+    if (!bc) return true;
+    var vals = bc.getCriteriaValues(); // NOT getValues() — that method doesn't exist on BooleanCondition
+    return !(vals && vals[0] === oldBooleanRowFormula);
+  });
+  sheet.setConditionalFormatRules(keptRules.concat([fullMatchRule, partialMatchRule]));
 }
 
 // ============================================================
@@ -183,6 +221,164 @@ function jsMatchesFilterV2(text, groups) {
   var notHit = negative.some(function(g) { return termsAnyMatchV2(text, g); });
 
   return { isMatch: positiveOk, flagged: positiveOk && notHit };
+}
+
+// ============================================================
+// Filter Match column + row highlight — three-state for v2
+//
+// v1's Filter Match column (and the shared buildFilterMatchFromTermCols in
+// snowball.js) is boolean TRUE/FALSE, hard-veto. For v2, since a NOT-group
+// hit is score-demoted rather than a veto, a boolean column would show
+// FALSE for a paper that's actually being kept and expanded — visually
+// indistinguishable from a genuine reject. buildFilterMatchFromTermColsV2
+// mirrors the shared formula's structure and reuses the same per-term
+// helper columns (built with the shared buildTermFormula), but outputs one
+// of three states instead:
+//   Full Match    — every positive group matched, no NOT-group matched
+//   Partial Match — every positive group matched, but a NOT-group also did
+//   No Match      — at least one positive group failed to match
+// ============================================================
+
+function buildFilterMatchFromTermColsV2(parsedGroups, firstDetailColNum) {
+  const totalTerms = parsedGroups.reduce(function(s, g) { return s + g.terms.length; }, 0);
+  if (totalTerms === 0) return null;
+
+  const params = parsedGroups.map(function(g, gi) {
+    return g.terms.map(function(t, ti) {
+      const idx = parsedGroups.slice(0, gi).reduce(function(s, pg) { return s + pg.terms.length; }, 0) + ti;
+      return makeParamName(idx); // from snowball.js
+    });
+  });
+
+  const ranges = params.map(function(groupParams, gi) {
+    return groupParams.map(function(p, ti) {
+      const colNum = firstDetailColNum +
+        parsedGroups.slice(0, gi).reduce(function(s, pg) { return s + pg.terms.length; }, 0) + ti;
+      const l = colToLetter(colNum); // from snowball.js
+      return l + '2:' + l;
+    }).join(',');
+  }).join(',');
+
+  const allParams = 'a,' + params.map(function(gp) { return gp.join(','); }).join(',');
+
+  function orExprFor(gi) {
+    const gParams = params[gi];
+    return gParams.length === 1 ? gParams[0] : ('OR(' + gParams.join(',') + ')');
+  }
+
+  const positiveIdx = parsedGroups.map(function(g, gi) { return g.not ? null : gi; })
+    .filter(function(x) { return x !== null; });
+  const positiveExpr = positiveIdx.length === 0
+    ? 'TRUE'
+    : (positiveIdx.length === 1 ? orExprFor(positiveIdx[0]) : ('AND(' + positiveIdx.map(orExprFor).join(',') + ')'));
+
+  const negativeIdx = parsedGroups.map(function(g, gi) { return g.not ? gi : null; })
+    .filter(function(x) { return x !== null; });
+  const negativeExpr = negativeIdx.length === 0
+    ? 'FALSE'
+    : (negativeIdx.length === 1 ? orExprFor(negativeIdx[0]) : ('OR(' + negativeIdx.map(orExprFor).join(',') + ')'));
+
+  const stateExpr =
+    'IF(NOT(' + positiveExpr + '),"No Match",IF(' + negativeExpr + ',"Partial Match","Full Match"))';
+
+  return '=MAP(A2:A,' + ranges + ',LAMBDA(' + allParams + ',' +
+         'IF(ROW(a)=2,"Filter Match",' +
+         'IF(a="","",' + stateExpr + '))))';
+}
+
+// v2 variant of crawl.js's applyCrawlHighlight — identical term-helper
+// column writing (reuses buildTermFormula unmodified), but wires the
+// three-state formula above into the Filter Match column instead of the
+// shared boolean one. The Full/Partial Match row-highlight CF rules
+// themselves are set up once in setupCrawlV2Sheet and survive being
+// re-applied here (they don't touch the term-helper columns, so the same
+// "keep everything not touching helper cols" filter below preserves them,
+// exactly as it preserves v1's green rule in applyCrawlHighlight).
+function applyCrawlV2Highlight(sheet, groups) {
+  var CRAWL_FIRST_DETAIL = CRAWL_FIRST_DETAIL_COL;
+
+  sheet.getRange(2, CRAWL_IN_SHEET_LINKS_COL)
+    .setFormula(CRAWL_IN_SHEET_LINKS_FORMULA)
+    .setFontWeight('bold').setBackground('#4285f4').setFontColor('white');
+  sheet.setColumnWidth(CRAWL_IN_SHEET_LINKS_COL, 90);
+
+  var parsed = groups.map(function(g) {
+    return {
+      not:   g.not,
+      terms: (g.terms || '').split(',')
+        .map(function(t) { return t.trim().replace(/^["'"']|["'"']$/g, '').trim(); })
+        .filter(function(t) { return t.length > 0; })
+    };
+  }).filter(function(g) { return g.terms.length > 0; });
+
+  if (parsed.length === 0) return;
+
+  var maxHelper = 60;
+  sheet.getRange(1, CRAWL_FIRST_DETAIL, 1, maxHelper).breakApart().clearContent().clearFormat();
+  sheet.getRange(2, CRAWL_FIRST_DETAIL, 1, maxHelper).clearContent().clearFormat();
+
+  var colNum = CRAWL_FIRST_DETAIL;
+  parsed.forEach(function(g, groupIdx) {
+    var groupStartCol = colNum;
+    var isNot  = g.not;
+    var termBg = isNot ? '#fce8e6' : '#e8f0fe';
+
+    g.terms.forEach(function(term) {
+      sheet.getRange(2, colNum)
+        .setFormula(buildTermFormula(term, CRAWL_COL.TITLE, CRAWL_COL.ABSTRACT)) // from snowball.js
+        .setFontWeight('bold')
+        .setHorizontalAlignment('center')
+        .setVerticalAlignment('bottom')
+        .setTextRotation(90)
+        .setBackground(termBg)
+        .setFontColor('#222');
+      sheet.setColumnWidth(colNum, 35);
+      colNum++;
+    });
+
+    if (g.terms.length > 0) {
+      var label = (isNot ? 'NOT Group ' : 'Group ') + (groupIdx + 1);
+      var hdrBg = isNot ? '#e53935' : '#1a73e8';
+      sheet.getRange(1, groupStartCol, 1, g.terms.length)
+        .merge()
+        .setValue(label)
+        .setBackground(hdrBg)
+        .setFontColor('white')
+        .setFontWeight('bold')
+        .setHorizontalAlignment('center');
+
+      sheet.getRange(1, groupStartCol, sheet.getMaxRows(), 1)
+        .setBorder(null, true, null, null, null, null,
+                   '#555555', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+    }
+  });
+
+  if (colNum > CRAWL_FIRST_DETAIL) {
+    sheet.setRowHeight(2, 130);
+
+    var termDataRange = sheet.getRange(3, CRAWL_FIRST_DETAIL, sheet.getMaxRows() - 2, colNum - CRAWL_FIRST_DETAIL);
+    var startLetter = colToLetter(CRAWL_FIRST_DETAIL);
+    var trueRule = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=' + startLetter + '3=TRUE')
+      .setBackground('#FFF176').setFontColor('#FFF176')
+      .setRanges([termDataRange]).build();
+    var falseRule = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=' + startLetter + '3=FALSE')
+      .setBackground('#FFFFFF').setFontColor('#FFFFFF')
+      .setRanges([termDataRange]).build();
+    var existingRules = sheet.getConditionalFormatRules().filter(function(rule) {
+      return !rule.getRanges().some(function(r) { return r.getColumn() >= CRAWL_FIRST_DETAIL; });
+    });
+    sheet.setConditionalFormatRules(existingRules.concat([trueRule, falseRule]));
+  }
+
+  var filterFormula = buildFilterMatchFromTermColsV2(parsed, CRAWL_FIRST_DETAIL);
+  if (!filterFormula) return;
+  sheet.getRange(2, CRAWL_COL.FILTER_MATCH)
+    .setFormula(filterFormula)
+    .setFontWeight('bold')
+    .setBackground('#4285f4')
+    .setFontColor('white');
 }
 
 // ============================================================
@@ -841,7 +1037,7 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
     }
 
     ss.setActiveSheet(sheet);
-    applyCrawlHighlight(sheet, groups); // reused directly from crawl.js — identical sheet layout
+    applyCrawlV2Highlight(sheet, groups); // three-state Full/Partial/No Match, not v1's boolean version
 
     createCrawlV2Trigger();
     setCrawlStatus(sheet, 'Running keyword pass batch 1…');
@@ -889,7 +1085,7 @@ function applyCrawlV2Filter(groups) {
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
     if (!sheet) return 'Crawl sheet "' + sheetName + '" not found.';
     props.setProperty('CRAWL2_FILTER_GROUPS', JSON.stringify(groups));
-    applyCrawlHighlight(sheet, groups); // shared, identical sheet layout
+    applyCrawlV2Highlight(sheet, groups); // three-state Full/Partial/No Match, not v1's boolean version
     return 'Highlight rule updated on "' + sheetName + '".';
   } catch (e) {
     return 'Error: ' + e.message;

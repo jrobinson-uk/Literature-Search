@@ -35,8 +35,16 @@
 //     by default.
 // ============================================================
 
-const CRAWL2_TIME_LIMIT_MS         = CRAWL_TIME_LIMIT_MS; // share v1's budget/reasoning
-const CRAWL2_MAX_CONSEC_FAILURES   = CRAWL_MAX_CONSEC_FAILURES;
+// Literal values, not references to crawl.js's CRAWL_TIME_LIMIT_MS /
+// CRAWL_MAX_CONSEC_FAILURES — Apps Script concatenates every .js file into
+// one execution context, and top-level `const` initialization across files
+// depends on file load order, which isn't something to rely on. Same
+// values as v1, kept in sync manually; duplicating two numbers here is a
+// far smaller risk than a load-order-dependent ReferenceError that would
+// silently break onOpen() (and with it, the whole custom menu) if the
+// files ever load in the "wrong" order.
+const CRAWL2_TIME_LIMIT_MS       = 4 * 60 * 1000;
+const CRAWL2_MAX_CONSEC_FAILURES = 3;
 
 // Longer retry effort than v1's OPENALEX_BACKOFF_MS — validated response to
 // "persist with the search for longer before moving on" rather than adding

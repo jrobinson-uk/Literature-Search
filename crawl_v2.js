@@ -114,47 +114,14 @@ function cancelCrawlV2() {
 // Sheet setup — reuses v1's layout entirely
 // ============================================================
 
-// Placeholder Filter Match formula for v2 sheets — three-state text
-// ("No Match" until a real filter is applied), replacing setupCrawlSheet's
-// boolean CRAWL_DEFAULT_FILTER_FORMULA placeholder.
-const CRAWL2_DEFAULT_FILTER_FORMULA =
-  '=MAP(A2:A,H2:H,LAMBDA(a,h,IF(ROW(a)=2,"Filter Match",IF(a<>"","No Match",""))))';
-
 function setupCrawlV2Sheet(sheet, seedLabel) {
-  setupCrawlSheet(sheet, 'forward', seedLabel); // identical column layout to v1
+  setupCrawlSheet(sheet, 'forward', seedLabel); // identical column layout, placeholder formula, and CF rules to v1
   sheet.getRange(1, 1).setValue('Pipeline crawl (v2: keyword → backward → forward)');
-
-  // v1's Filter Match column is boolean (TRUE/FALSE); v2's is three-state
-  // text (Full Match / Partial Match / No Match) so a score-demoted
-  // NOT-group hit is visibly distinguished from both a clean match and a
-  // genuine reject, rather than showing FALSE like today's non-matches.
-  // Swap in the text placeholder and replace setupCrawlSheet's
-  // boolean-keyed green row-highlight rule (=$K3=TRUE, which would never
-  // fire again once K holds text) with two text-keyed rules — full green,
-  // partial orange. The no-abstract yellow-tint rule is untouched.
-  sheet.getRange(2, CRAWL_COL.FILTER_MATCH)
-    .setFormula(CRAWL2_DEFAULT_FILTER_FORMULA)
-    .setFontWeight('bold').setBackground('#4285f4').setFontColor('white');
-
-  var maxRows   = sheet.getMaxRows();
-  var fullRange = sheet.getRange(3, 1, maxRows - 2, CRAWL_NUM_COLS);
-  var fullMatchRule = SpreadsheetApp.newConditionalFormatRule()
-    .whenFormulaSatisfied('=$' + CRAWL_FILTER_MATCH_COL_LETTER + '3="Full Match"')
-    .setBackground('#b7e1cd') // same green as v1's clean-match highlight
-    .setRanges([fullRange]).build();
-  var partialMatchRule = SpreadsheetApp.newConditionalFormatRule()
-    .whenFormulaSatisfied('=$' + CRAWL_FILTER_MATCH_COL_LETTER + '3="Partial Match"')
-    .setBackground('#ffe0b2') // orange — score-demoted NOT-group hit, still kept/expanded
-    .setRanges([fullRange]).build();
-
-  var oldBooleanRowFormula = '=$' + CRAWL_FILTER_MATCH_COL_LETTER + '3=TRUE';
-  var keptRules = sheet.getConditionalFormatRules().filter(function(rule) {
-    var bc = rule.getBooleanCondition();
-    if (!bc) return true;
-    var vals = bc.getCriteriaValues(); // NOT getValues() — that method doesn't exist on BooleanCondition
-    return !(vals && vals[0] === oldBooleanRowFormula);
-  });
-  sheet.setConditionalFormatRules(keptRules.concat([fullMatchRule, partialMatchRule]));
+  // Filter Match stays boolean TRUE/FALSE (same as v1) — the placeholder is
+  // FALSE-for-all until a real filter is applied, same as v1, so nothing
+  // else needs overriding here. applyCrawlV2Highlight below replaces v1's
+  // single green row rule with a refined green/orange pair once real
+  // filter groups exist.
 }
 
 // ============================================================
@@ -224,22 +191,25 @@ function jsMatchesFilterV2(text, groups) {
 }
 
 // ============================================================
-// Filter Match column + row highlight — three-state for v2
+// Filter Match column + row highlight
 //
-// v1's Filter Match column (and the shared buildFilterMatchFromTermCols in
-// snowball.js) is boolean TRUE/FALSE, hard-veto. For v2, since a NOT-group
-// hit is score-demoted rather than a veto, a boolean column would show
-// FALSE for a paper that's actually being kept and expanded — visually
-// indistinguishable from a genuine reject. buildFilterMatchFromTermColsV2
-// mirrors the shared formula's structure and reuses the same per-term
-// helper columns (built with the shared buildTermFormula), but outputs one
-// of three states instead:
-//   Full Match    — every positive group matched, no NOT-group matched
-//   Partial Match — every positive group matched, but a NOT-group also did
-//   No Match      — at least one positive group failed to match
+// Column K stays boolean TRUE/FALSE, same as v1 — TRUE iff every positive
+// group matched, exactly mirroring jsMatchesFilterV2's isMatch (a NOT-group
+// hit does NOT flip K to FALSE, since a NOT-hit is score-demoted, not a
+// veto — the paper still counts as a match and still propagates).
+// buildFilterMatchFormulaV2 mirrors the shared buildFilterMatchFromTermCols'
+// structure and reuses the same per-term helper columns, but ANDs only the
+// positive groups — NOT-group term columns don't feed into K's value at all.
+//
+// The row highlight is where NOT-hits actually show up: green when K=TRUE
+// and no NOT-group matched, orange when K=TRUE and a NOT-group also
+// matched (the score-demoted case). buildNotHitFormulaForRow builds a
+// plain per-row OR(...) expression directly over the NOT-groups' own
+// term-helper cells (not the MAP-internal param names used inside K's
+// formula) so the two CF rules below can reference it independently of K.
 // ============================================================
 
-function buildFilterMatchFromTermColsV2(parsedGroups, firstDetailColNum) {
+function buildFilterMatchFormulaV2(parsedGroups, firstDetailColNum) {
   const totalTerms = parsedGroups.reduce(function(s, g) { return s + g.terms.length; }, 0);
   if (totalTerms === 0) return null;
 
@@ -266,34 +236,43 @@ function buildFilterMatchFromTermColsV2(parsedGroups, firstDetailColNum) {
     return gParams.length === 1 ? gParams[0] : ('OR(' + gParams.join(',') + ')');
   }
 
+  // AND across positive groups only — NOT-groups don't participate in K's
+  // value at all (not even wrapped in NOT()), unlike v1's hard-veto formula.
   const positiveIdx = parsedGroups.map(function(g, gi) { return g.not ? null : gi; })
     .filter(function(x) { return x !== null; });
   const positiveExpr = positiveIdx.length === 0
     ? 'TRUE'
     : (positiveIdx.length === 1 ? orExprFor(positiveIdx[0]) : ('AND(' + positiveIdx.map(orExprFor).join(',') + ')'));
 
-  const negativeIdx = parsedGroups.map(function(g, gi) { return g.not ? gi : null; })
-    .filter(function(x) { return x !== null; });
-  const negativeExpr = negativeIdx.length === 0
-    ? 'FALSE'
-    : (negativeIdx.length === 1 ? orExprFor(negativeIdx[0]) : ('OR(' + negativeIdx.map(orExprFor).join(',') + ')'));
-
-  const stateExpr =
-    'IF(NOT(' + positiveExpr + '),"No Match",IF(' + negativeExpr + ',"Partial Match","Full Match"))';
-
   return '=MAP(A2:A,' + ranges + ',LAMBDA(' + allParams + ',' +
          'IF(ROW(a)=2,"Filter Match",' +
-         'IF(a="","",' + stateExpr + '))))';
+         'IF(a="","",' + positiveExpr + '))))';
+}
+
+// Plain per-row OR(...) expression over the NOT-groups' term-helper cells,
+// for use in a whenFormulaSatisfied CF rule (relative row references, same
+// convention as v1's own row-highlight rule) — not part of K's own formula.
+// Walks parsedGroups in the same column order applyCrawlV2Highlight lays
+// term-helper columns out in, so the column math matches exactly.
+function buildNotHitFormulaForRow(parsedGroups, firstDetailColNum, row) {
+  var colNum = firstDetailColNum;
+  var negativeGroupCells = [];
+  parsedGroups.forEach(function(g) {
+    var cells = g.terms.map(function() { return colToLetter(colNum++) + row; });
+    if (g.not) negativeGroupCells.push(cells);
+  });
+  if (negativeGroupCells.length === 0) return 'FALSE';
+  var groupExprs = negativeGroupCells.map(function(cells) {
+    return cells.length === 1 ? cells[0] : ('OR(' + cells.join(',') + ')');
+  });
+  return groupExprs.length === 1 ? groupExprs[0] : ('OR(' + groupExprs.join(',') + ')');
 }
 
 // v2 variant of crawl.js's applyCrawlHighlight — identical term-helper
 // column writing (reuses buildTermFormula unmodified), but wires the
-// three-state formula above into the Filter Match column instead of the
-// shared boolean one. The Full/Partial Match row-highlight CF rules
-// themselves are set up once in setupCrawlV2Sheet and survive being
-// re-applied here (they don't touch the term-helper columns, so the same
-// "keep everything not touching helper cols" filter below preserves them,
-// exactly as it preserves v1's green rule in applyCrawlHighlight).
+// positive-only formula above into the Filter Match column instead of the
+// shared hard-veto one, and replaces v1's single green row rule with a
+// green/orange pair keyed on K plus the NOT-hit formula.
 function applyCrawlV2Highlight(sheet, groups) {
   var CRAWL_FIRST_DETAIL = CRAWL_FIRST_DETAIL_COL;
 
@@ -366,13 +345,48 @@ function applyCrawlV2Highlight(sheet, groups) {
       .whenFormulaSatisfied('=' + startLetter + '3=FALSE')
       .setBackground('#FFFFFF').setFontColor('#FFFFFF')
       .setRanges([termDataRange]).build();
+
+    // Row highlight: green when K=TRUE and no NOT-group also hit; orange
+    // when K=TRUE and a NOT-group did (the score-demoted case) — replaces
+    // v1's single green =$K3=TRUE rule, which doesn't distinguish the two.
+    var notHitFormula = buildNotHitFormulaForRow(parsed, CRAWL_FIRST_DETAIL, 3);
+    var kLetter       = CRAWL_FILTER_MATCH_COL_LETTER; // "K" — from crawl.js
+    var fullRowRange  = sheet.getRange(3, 1, sheet.getMaxRows() - 2, CRAWL_NUM_COLS);
+    var fullMatchRule = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=AND($' + kLetter + '3=TRUE,NOT(' + notHitFormula + '))')
+      .setBackground('#b7e1cd') // same green as v1
+      .setRanges([fullRowRange]).build();
+    var partialMatchRule = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=AND($' + kLetter + '3=TRUE,' + notHitFormula + ')')
+      .setBackground('#ffe0b2') // orange — NOT-group hit, still a match, still expands
+      .setRanges([fullRowRange]).build();
+
+    // Drop anything touching the term-helper columns (stale per-term rules
+    // from a previous Apply Highlight Rule click), v1's old single green
+    // row rule (=$K3=TRUE, with no NOT-hit distinction), AND any full/
+    // partial row rule from a PREVIOUS Apply Highlight Rule click — those
+    // embed the NOT-hit sub-formula, which changes whenever filter groups
+    // change, so they can't be matched by exact string; a stable prefix
+    // (=AND($K3=TRUE...) is enough to catch either variant regardless of
+    // its embedded NOT-hit expression. Keep everything else (notably the
+    // no-abstract yellow-tint rule).
+    var oldGreenRowFormula   = '=$' + kLetter + '3=TRUE';
+    var rowRulePrefix        = '=AND($' + kLetter + '3=TRUE';
     var existingRules = sheet.getConditionalFormatRules().filter(function(rule) {
-      return !rule.getRanges().some(function(r) { return r.getColumn() >= CRAWL_FIRST_DETAIL; });
+      if (rule.getRanges().some(function(r) { return r.getColumn() >= CRAWL_FIRST_DETAIL; })) return false;
+      var bc = rule.getBooleanCondition();
+      if (bc) {
+        var vals    = bc.getCriteriaValues();
+        var formula = vals && vals[0];
+        if (formula === oldGreenRowFormula) return false;
+        if (formula && formula.indexOf(rowRulePrefix) === 0) return false;
+      }
+      return true;
     });
-    sheet.setConditionalFormatRules(existingRules.concat([trueRule, falseRule]));
+    sheet.setConditionalFormatRules(existingRules.concat([trueRule, falseRule, fullMatchRule, partialMatchRule]));
   }
 
-  var filterFormula = buildFilterMatchFromTermColsV2(parsed, CRAWL_FIRST_DETAIL);
+  var filterFormula = buildFilterMatchFormulaV2(parsed, CRAWL_FIRST_DETAIL);
   if (!filterFormula) return;
   sheet.getRange(2, CRAWL_COL.FILTER_MATCH)
     .setFormula(filterFormula)

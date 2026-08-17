@@ -396,16 +396,25 @@ function applyCrawlV2Highlight(sheet, groups) {
 }
 
 // ============================================================
-// Row builder — same shape as crawlRowFromS2, plus the score-demotion
-// title marker.
-// ============================================================
-
-function buildCrawlV2Row(candidate, depth, parentId, dir, flagged) {
-  var row = crawlRowFromS2(candidate, depth, parentId, dir); // from crawl.js
-  if (flagged) {
-    row[CRAWL_COL.TITLE - 1] = '⚠ [NOT-group override — review] ' + row[CRAWL_COL.TITLE - 1];
+// Score-demotion note — the NOT-group-override signal used to live as a
+// Title-prefix marker, but that alters the Title text itself (unlike every
+// other v2 signal, which is out-of-band: the row's orange/green highlight,
+// or a cell note). Moved to a note on the Filter Match cell instead — same
+// non-invasive convention as the existing abstract-source notes, and the
+// most discoverable spot since it explains exactly why that cell is
+// orange. Rows are written via crawlRowFromS2 directly (from crawl.js) —
+// no v2-specific row-building wrapper needed now that nothing mutates
+// the row itself.
+function applyNotGroupNotes(sheet, startRow, flags) {
+  if (!startRow) return;
+  for (var i = 0; i < flags.length; i++) {
+    if (!flags[i]) continue;
+    sheet.getRange(startRow + i, CRAWL_COL.FILTER_MATCH).setNote(
+      'Matches every positive filter group, but also matched a NOT-group — ' +
+      'kept and expanded (score-demoted) rather than excluded. Highlighted ' +
+      'orange for the same reason.'
+    );
   }
-  return row;
 }
 
 // ============================================================
@@ -554,6 +563,7 @@ function runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCe
 
     var newRows  = [];
     var newNotes = [];
+    var newFlags = []; // aligned with newRows — true for a score-demoted NOT-group hit
     results.forEach(function(paper) {
       if (!paper || !paper.paperId || collected >= targetSeeds) return;
       var mag = paper.externalIds && paper.externalIds.MAG;
@@ -579,8 +589,9 @@ function runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCe
 
       existing.ids.add(id);
       if (normTitle) existing.titles.add(normTitle);
-      newRows.push(buildCrawlV2Row(paper, 0, '', 'K', verdict.flagged));
+      newRows.push(crawlRowFromS2(paper, 0, '', 'K')); // from crawl.js
       newNotes.push(note);
+      newFlags.push(verdict.flagged);
       collected++;
     });
 
@@ -589,6 +600,7 @@ function runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCe
       var canAdd        = Math.max(0, maxPapers - currentCount);
       var writeStart     = writeCrawlRows(sheet, newRows.slice(0, canAdd));
       applyAbstractNotes(sheet, writeStart, newNotes.slice(0, canAdd));
+      applyNotGroupNotes(sheet, writeStart, newFlags.slice(0, canAdd));
     }
   }
 
@@ -667,6 +679,7 @@ function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCe
 
     var newRows  = [];
     var newNotes = [];
+    var newFlags = []; // aligned with newRows — true for a score-demoted NOT-group hit
     refs.forEach(function(ref) {
       if (!ref || !ref.paperId) return;
       var mag   = ref.externalIds && ref.externalIds.MAG;
@@ -688,8 +701,9 @@ function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCe
 
       existing.ids.add(refId);
       if (normTitle) existing.titles.add(normTitle);
-      newRows.push(buildCrawlV2Row(ref, paperDepth + 1, paperId, 'B', verdict.flagged));
+      newRows.push(crawlRowFromS2(ref, paperDepth + 1, paperId, 'B')); // from crawl.js
       newNotes.push(note);
+      newFlags.push(verdict.flagged);
     });
 
     if (newRows.length > 0) {
@@ -697,6 +711,7 @@ function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCe
       var canAdd        = Math.max(0, maxPapers - currentCount);
       var writeStart     = writeCrawlRows(sheet, newRows.slice(0, canAdd));
       applyAbstractNotes(sheet, writeStart, newNotes.slice(0, canAdd));
+      applyNotGroupNotes(sheet, writeStart, newFlags.slice(0, canAdd));
     }
   }
 
@@ -761,6 +776,7 @@ function runForwardPassV2(sheet, groups, maxDepth, maxPapers, matchesOnly, yearF
     var existing      = getCrawlV2ExistingKeys(sheet);
     var matchRows     = [];
     var abstractNotes = [];
+    var notGroupFlags = []; // aligned with matchRows — true for a score-demoted NOT-group hit
     for (var i = 0; i < candidates.length; i++) {
       var c   = candidates[i];
       var mag = c.externalIds && c.externalIds.MAG;
@@ -781,10 +797,14 @@ function runForwardPassV2(sheet, groups, maxDepth, maxPapers, matchesOnly, yearF
       var verdict = jsMatchesFilterV2((c.title || '') + ' ' + abstract, groups);
       var isMatch = verdict.isMatch && yearOk;
       if (!isMatch && matchesOnly) continue;
-      var row = buildCrawlV2Row(c, depth + 1, id, 'F', verdict.flagged);
+      var row = crawlRowFromS2(c, depth + 1, id, 'F'); // from crawl.js
       if (!isMatch) row[CRAWL_COL.CRAWLED - 1] = true;
       matchRows.push(row);
       abstractNotes.push(note);
+      // Only a genuine match can carry the score-demotion note — if yearOk
+      // is what actually rejected it, "NOT-group override" would be a
+      // misleading explanation for why the row is there.
+      notGroupFlags.push(isMatch && verdict.flagged);
       existing.ids.add(cId);
       if (normTitle) existing.titles.add(normTitle);
     }
@@ -794,6 +814,7 @@ function runForwardPassV2(sheet, groups, maxDepth, maxPapers, matchesOnly, yearF
       var canAdd        = Math.max(0, maxPapers - currentCount);
       var writeStart     = writeCrawlRows(sheet, matchRows.slice(0, canAdd));
       applyAbstractNotes(sheet, writeStart, abstractNotes.slice(0, canAdd));
+      applyNotGroupNotes(sheet, writeStart, notGroupFlags.slice(0, canAdd));
       if (canAdd < matchRows.length) {
         sheet.getRange(sheetRow, CRAWL_COL.CRAWLED).setValue(true);
         processed++;
@@ -1044,7 +1065,7 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
     // brief's 3-value (K/B/F) Direction acceptance criterion. The keyword
     // pass (once the trigger starts) adds more seeds on top of these.
     if (seeds.length > 0) {
-      var seedRows = seeds.map(function(seed) { return buildCrawlV2Row(seed, 0, '', 'K', false); });
+      var seedRows = seeds.map(function(seed) { return crawlRowFromS2(seed, 0, '', 'K'); }); // from crawl.js
       sheet.getRange(3, 1, seedRows.length, CRAWL_NUM_COLS).setValues(seedRows);
       sheet.getRange(3, CRAWL_COL.CRAWLED, seedRows.length, 1).insertCheckboxes();
       sheet.setRowHeights(3, seedRows.length, CRAWL_ROW_HEIGHT);

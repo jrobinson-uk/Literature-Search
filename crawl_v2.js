@@ -53,10 +53,41 @@ const OPENALEX_BACKOFF_MS_V2 = [1000, 2000, 4000, 8000, 15000, 30000];
 
 const KEYWORD_SEARCH_TARGET_DEFAULT = 200;
 const KEYWORD_RESULTS_PER_QUERY     = 10;
-// Hard cap on generated queries so a filter with many terms per group can't
-// runaway into thousands of API calls — the cartesian product across
-// positive groups grows fast with term count.
-const KEYWORD_MAX_QUERIES = 400;
+// Default hard cap on generated queries for the plain (non-paginated)
+// keyword pass — the cartesian product across positive groups grows fast
+// with term count. The paginated alt-config raises this (see
+// CRAWL2_PHASE1_MAX_QUERIES) since each query now pulls several pages
+// instead of one, so more of the combination space can be reached before
+// hitting a per-run API-call ceiling.
+const KEYWORD_MAX_QUERIES         = 400;
+const KEYWORD_MAX_QUERIES_PAGINATED = 800;
+
+// v3 additions — off by default. §7 sign-off (2026-08-20): extend v2 in
+// place with these as opt-in config, not a separate v3 codebase; a run
+// with all of them left off reproduces today's (v19) behaviour exactly.
+const PHASE0_YEAR_FROM_DEFAULT = 2023;
+const PHASE0_YEAR_TO_DEFAULT   = 2026;
+// A-priori venue list from the v3 brief — added regardless of whether they
+// were represented in the v19 run. The other ~48 venues the brief derived
+// from v19 (those with ≥5 matches) aren't available here since that export
+// wasn't provided; the panel's venue list is a free-text field the user can
+// extend with them directly.
+const PHASE0_VENUES_DEFAULT = [
+  'IDC', 'WiPSCE', 'Koli Calling', 'TOCE', 'ICER V.2', 'SIGCSE V.2'
+];
+// S2's bulk-search endpoint returns up to this many rows per page,
+// paginated via a continuation token (confirmed against the live API,
+// not assumed) — used by both Phase 0 (venue enumeration) and Phase 1's
+// paginated alt-config.
+const S2_BULK_PAGE_SIZE = 1000;
+// How many venue names to pack into one bulk-search call's comma-separated
+// `venue` filter — S2 matches each fuzzily against canonical venue names
+// (confirmed: "SIGCSE" alone matched "Technical Symposium on Computer
+// Science Education"), so batching keeps the URL short without needing
+// exact venue-string matches.
+const PHASE0_VENUE_BATCH_SIZE = 10;
+const PHASE1_PAGES_PER_QUERY_DEFAULT     = 3;
+const PHASE1_SHORTFALL_TOLERANCE_DEFAULT = 0.5;
 
 // ============================================================
 // Trigger / status management (own namespace, mirrors crawl.js)
@@ -481,6 +512,117 @@ function idToExternalIdsV2(id) {
 }
 
 // ============================================================
+// Phase 0 — Venue enumeration sweep (v3, off by default)
+//
+// "Don't name papers, name the containers" — enumerates the full
+// publication record of a fixed venue list within a year window and runs
+// it through the existing filter, so poster/short-paper tracks come in by
+// construction (whole proceedings, not ranked search results) rather than
+// needing to rank well against a topical query. Runs before Phase 1 when
+// enabled; writes Direction='V' so its marginal yield is measurable
+// separately from keyword-pass seeding.
+//
+// Resumable across trigger batches like every other phase: CRAWL2_VENUE_
+// BATCH_IDX tracks which venue batch we're on, CRAWL2_VENUE_TOKEN tracks
+// pagination *within* the current batch (S2's bulk-search continuation
+// token — empty string means "start this batch's first page").
+// ============================================================
+
+function runVenueSweep(sheet, groups, venues, yearFrom, yearTo, maxPapers) {
+  var props = PropertiesService.getScriptProperties();
+  var batchIdx  = parseInt(props.getProperty('CRAWL2_VENUE_BATCH_IDX') || '0');
+  var token     = props.getProperty('CRAWL2_VENUE_TOKEN') || '';
+  var collected = parseInt(props.getProperty('CRAWL2_VENUE_COUNT') || '0');
+  var startTime = Date.now();
+
+  if (!venues || venues.length === 0) {
+    return { status: 'complete', message: 'Venue sweep complete — no venues configured.' };
+  }
+
+  var batches = [];
+  for (var i = 0; i < venues.length; i += PHASE0_VENUE_BATCH_SIZE) {
+    batches.push(venues.slice(i, i + PHASE0_VENUE_BATCH_SIZE).join(','));
+  }
+
+  var existing   = getCrawlV2ExistingKeys(sheet);
+  var yearRange  = yearFrom + '-' + yearTo;
+
+  while (batchIdx < batches.length) {
+    if (Date.now() - startTime > CRAWL2_TIME_LIMIT_MS) {
+      props.setProperty('CRAWL2_VENUE_BATCH_IDX', String(batchIdx));
+      props.setProperty('CRAWL2_VENUE_TOKEN', token);
+      props.setProperty('CRAWL2_VENUE_COUNT', String(collected));
+      return { status: 'time-limit', message: 'Venue sweep — time limit reached. ' + collected +
+             ' seed(s) collected so far (venue batch ' + (batchIdx + 1) + '/' + batches.length + ').' };
+    }
+
+    var result = s2BulkSearch({ venue: batches[batchIdx], year: yearRange, token: token || null });
+    Utilities.sleep(1100); // same S2 pacing used elsewhere in the project
+
+    var newRows  = [];
+    var newNotes = [];
+    var newFlags = []; // aligned with newRows — true for a score-demoted NOT-group hit
+    result.data.forEach(function(paper) {
+      if (!paper || !paper.paperId) return;
+      var mag = paper.externalIds && paper.externalIds.MAG;
+      var id  = mag ? ('W' + mag) : ('S2:' + paper.paperId);
+      if (existing.ids.has(id)) return;
+      var normTitle = normalizeTitleV2(paper.title);
+      if (normTitle && existing.titles.has(normTitle)) return;
+
+      var abstract = paper.abstract || '';
+      var note = null;
+      if (!abstract) {
+        var lookup = fetchOpenAlexAbstractV2(paper.externalIds);
+        if (lookup.abstract) { abstract = lookup.abstract; paper.abstract = lookup.abstract; }
+        note = describeAbstractSource(lookup); // from crawl.js
+      }
+
+      // Exhaustive by design (§3: "pass it through the existing filter") —
+      // no target cap, and no separate year gate here since the venue+year
+      // window is already applied server-side via the bulk-search call.
+      var verdict = jsMatchesFilterV2((paper.title || '') + ' ' + abstract, groups);
+      if (!verdict.isMatch) return;
+
+      existing.ids.add(id);
+      if (normTitle) existing.titles.add(normTitle);
+      newRows.push(crawlRowFromS2(paper, 0, '', 'V')); // from crawl.js — Direction='V'
+      newNotes.push(note);
+      newFlags.push(verdict.flagged);
+      collected++;
+    });
+
+    if (newRows.length > 0) {
+      var currentCount = getCrawlLastDataRow(sheet) - 2;
+      var canAdd        = Math.max(0, maxPapers - currentCount);
+      var writeStart     = writeCrawlRows(sheet, newRows.slice(0, canAdd));
+      applyAbstractNotes(sheet, writeStart, newNotes.slice(0, canAdd));
+      applyNotGroupNotes(sheet, writeStart, newFlags.slice(0, canAdd));
+      if (canAdd < newRows.length) {
+        props.setProperty('CRAWL2_VENUE_BATCH_IDX', String(batchIdx));
+        props.setProperty('CRAWL2_VENUE_TOKEN', token);
+        props.setProperty('CRAWL2_VENUE_COUNT', String(collected));
+        return { status: 'paper-limit', message: 'Paper limit (' + maxPapers + ') reached during venue sweep — ' +
+               'click Resume v2 Crawl to continue once you\'ve reviewed the sheet.' };
+      }
+    }
+
+    if (result.token) {
+      token = result.token; // more pages remain in this venue batch
+    } else {
+      batchIdx++; // this batch exhausted — move to the next group of venues
+      token = '';
+    }
+  }
+
+  props.setProperty('CRAWL2_VENUE_BATCH_IDX', String(batchIdx));
+  props.setProperty('CRAWL2_VENUE_TOKEN', '');
+  props.setProperty('CRAWL2_VENUE_COUNT', String(collected));
+  return { status: 'complete', message: 'Venue sweep complete. ' + collected +
+         ' seed paper(s) collected across ' + venues.length + ' venue(s).' };
+}
+
+// ============================================================
 // Phase 1 — Keyword pass
 // ============================================================
 
@@ -494,6 +636,61 @@ function s2SearchPapers(query, limit) {
   return data.data || [];
 }
 
+// ============================================================
+// S2 bulk-search — shared by Phase 0 (venue enumeration) and Phase 1's
+// paginated alt-config. Distinct from s2SearchPapers's relevance-ranked
+// /paper/search (which only ever returns a small top-N): /paper/search/bulk
+// returns EVERYTHING matching the given filters, in pages of up to
+// S2_BULK_PAGE_SIZE, via a continuation token — confirmed directly against
+// the live endpoint before writing this (not assumed from memory):
+//   - `query` is optional — omitting it entirely enumerates by venue/year
+//     alone, which is exactly what Phase 0 needs ("the full publication
+//     record", not a topical search).
+//   - `venue` accepts a comma-separated list and fuzzy-matches each against
+//     canonical venue names (e.g. "SIGCSE" alone matched "Technical
+//     Symposium on Computer Science Education").
+//   - `year` takes a "YYYY-YYYY" range.
+//   - `sort` accepts "publicationDate:desc" for the date-sorted sweep.
+//   - response is {total, token, data} — token is null once exhausted.
+//
+// opts: { query, venue, year, sort, token, fields }. Returns
+// { total, token, data } — data is [] and token is null on any HTTP error
+// (treated as "nothing more this call", same non-fatal-per-call convention
+// as s2SearchPapers) rather than throwing, so one bad page doesn't abort
+// an entire venue/query sweep.
+function s2BulkSearch(opts) {
+  var fields = opts.fields ||
+    'paperId,externalIds,title,abstract,year,authors,citationCount,publicationTypes,venue';
+  var params = ['fields=' + encodeURIComponent(fields)];
+  if (opts.query)  params.push('query=' + encodeURIComponent(opts.query));
+  if (opts.venue)  params.push('venue=' + encodeURIComponent(opts.venue));
+  if (opts.year)   params.push('year=' + encodeURIComponent(opts.year));
+  if (opts.sort)   params.push('sort=' + encodeURIComponent(opts.sort));
+  if (opts.token)  params.push('token=' + encodeURIComponent(opts.token));
+
+  var url  = 'https://api.semanticscholar.org/graph/v1/paper/search/bulk?' + params.join('&');
+  var resp = s2Fetch(url); // from crawl.js — handles 429 back-off
+  if (resp.getResponseCode() !== 200) return { total: 0, token: null, data: [] };
+  var data = JSON.parse(resp.getContentText());
+  if (data.error) return { total: 0, token: null, data: [] }; // e.g. an over-broad query with no venue/year filter
+  return { total: data.total || 0, token: data.token || null, data: data.data || [] };
+}
+
+// Strips common boilerplate ("Proceedings of the 2026 ACM Conference on…")
+// so venue-string variants for the same conference collapse for matching
+// and reporting purposes (Gap 5: "ICER appears under at least two venue
+// strings"). Deliberately modest — a full canonical-venue database is out
+// of scope — this only handles the common ACM/IEEE proceedings-title
+// pattern, not every possible variant.
+function normalizeVenueLabel(venue) {
+  return (venue || '')
+    .replace(/^Proceedings of the \d{4}[^-–—]*(ACM|IEEE)?\s*(Conference|Symposium|Workshop) on\s+/i, '')
+    .replace(/^\d+(st|nd|rd|th)\s+/i, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
 function parseGroupTermsV2(group) {
   return (group.terms || '').split(',')
     .map(function(t) { return t.trim().replace(/^["']|["']$/g, '').trim(); })
@@ -505,7 +702,19 @@ function parseGroupTermsV2(group) {
 // search has no boolean operators; it's relevance-ranked, not literal AND).
 // NOT-groups don't contribute to query generation, only to post-filtering,
 // same as everywhere else. Capped at KEYWORD_MAX_QUERIES.
-function buildKeywordQueries(groups) {
+// maxQueries defaults to KEYWORD_MAX_QUERIES (plain mode) but the
+// paginated alt-config passes a higher cap (KEYWORD_MAX_QUERIES_PAGINATED)
+// since each query now pulls several pages instead of one.
+//
+// Combos are shuffled before the cap is applied — reduce()'s nested-loop
+// order otherwise means whichever positive group is listed FIRST gets full
+// term coverage while later groups' terms are systematically under-
+// represented once the list is truncated (a concrete, code-level
+// explanation for the brief's Gap 1 "generic terms absorbing the budget"
+// complaint: if a broad term sits early in group order, every combination
+// containing it survives a truncation that drops later, narrower combos).
+function buildKeywordQueries(groups, maxQueries) {
+  maxQueries = maxQueries || KEYWORD_MAX_QUERIES;
   var positiveTermLists = groups
     .filter(function(g) { return !g.not; })
     .map(parseGroupTermsV2)
@@ -521,10 +730,15 @@ function buildKeywordQueries(groups) {
     return next;
   }, [[]]);
 
+  for (var i = combos.length - 1; i > 0; i--) {
+    var j = Math.floor(Math.random() * (i + 1));
+    var tmp = combos[i]; combos[i] = combos[j]; combos[j] = tmp;
+  }
+
   var seen    = new Set();
   var queries = [];
-  for (var i = 0; i < combos.length && queries.length < KEYWORD_MAX_QUERIES; i++) {
-    var q = combos[i].join(' ');
+  for (var k = 0; k < combos.length && queries.length < maxQueries; k++) {
+    var q = combos[k].join(' ');
     if (seen.has(q)) continue;
     seen.add(q);
     queries.push(q);
@@ -535,11 +749,48 @@ function buildKeywordQueries(groups) {
 // Resumable across trigger firings via CRAWL2_KEYWORD_IDX / _COLLECTED.
 // Every kept seed is written Direction='K', Depth=0, Crawled=false — ready
 // for the backward/forward phases to expand from once this phase ends.
-function runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCeiling, yearBound) {
+//
+// opts (all off/default unless set, so a plain call reproduces today's
+// v19 behaviour exactly — v3 §0.2):
+//   paginated:          use S2's bulk-search endpoint with up to
+//                        pagesPerQuery pages per query, instead of a
+//                        single small page from the relevance-only
+//                        /paper/search endpoint.
+//   pagesPerQuery:       default PHASE1_PAGES_PER_QUERY_DEFAULT (3).
+//   dateSweep:           after the relevance-sorted pass exhausts its
+//                        query list, run the SAME queries again sorted by
+//                        publicationDate:desc — only meaningful (and only
+//                        applied) when paginated is also on, since only
+//                        the bulk endpoint exposes a sort param.
+//   noYearFloor:         ignore yearBound entirely for this phase's own
+//                        candidates (backward/forward keep it regardless).
+//   maxQueries:          query-generation cap; defaults to
+//                        KEYWORD_MAX_QUERIES_PAGINATED when paginated,
+//                        else KEYWORD_MAX_QUERIES.
+//   shortfallTolerance:  fraction of targetSeeds below which the phase
+//                        returns status 'shortfall' instead of 'complete'
+//                        — required instrumentation per the brief ("a 14%
+//                        shortfall passed silently in v19"); the trigger
+//                        stops rather than cascading into backward/forward
+//                        with a thin seed set.
+function runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCeiling, yearBound, opts) {
+  opts = opts || {};
+  var paginated  = !!opts.paginated;
+  var pagesPerQuery = parseInt(opts.pagesPerQuery) || PHASE1_PAGES_PER_QUERY_DEFAULT;
+  var dateSweep  = !!opts.dateSweep && paginated;
+  var noYearFloor = !!opts.noYearFloor;
+  var maxQueries = parseInt(opts.maxQueries) || (paginated ? KEYWORD_MAX_QUERIES_PAGINATED : KEYWORD_MAX_QUERIES);
+  var shortfallTolerance = (opts.shortfallTolerance != null && opts.shortfallTolerance !== '')
+    ? parseFloat(opts.shortfallTolerance) : PHASE1_SHORTFALL_TOLERANCE_DEFAULT;
+  var effectiveYearBound = noYearFloor ? false : yearBound;
+
   var props   = PropertiesService.getScriptProperties();
-  var queries = buildKeywordQueries(groups);
-  var idx       = parseInt(props.getProperty('CRAWL2_KEYWORD_IDX')       || '0');
-  var collected = parseInt(props.getProperty('CRAWL2_KEYWORD_COLLECTED') || '0');
+  var queries = buildKeywordQueries(groups, maxQueries);
+  var subphase      = props.getProperty('CRAWL2_KEYWORD_SUBPHASE')        || 'relevance'; // 'relevance' | 'date'
+  var idx           = parseInt(props.getProperty('CRAWL2_KEYWORD_IDX')             || '0');
+  var collected     = parseInt(props.getProperty('CRAWL2_KEYWORD_COLLECTED')       || '0');
+  var queriesIssued = parseInt(props.getProperty('CRAWL2_KEYWORD_QUERIES_ISSUED')  || '0');
+  var resultsSeen   = parseInt(props.getProperty('CRAWL2_KEYWORD_RESULTS_SEEN')    || '0');
   var startTime = Date.now();
 
   if (queries.length === 0) {
@@ -548,17 +799,53 @@ function runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCe
 
   var existing = getCrawlV2ExistingKeys(sheet);
 
-  while (idx < queries.length && collected < targetSeeds) {
+  function persistProgress() {
+    props.setProperty('CRAWL2_KEYWORD_SUBPHASE', subphase);
+    props.setProperty('CRAWL2_KEYWORD_IDX', String(idx));
+    props.setProperty('CRAWL2_KEYWORD_COLLECTED', String(collected));
+    props.setProperty('CRAWL2_KEYWORD_QUERIES_ISSUED', String(queriesIssued));
+    props.setProperty('CRAWL2_KEYWORD_RESULTS_SEEN', String(resultsSeen));
+  }
+
+  while (collected < targetSeeds) {
+    if (idx >= queries.length) {
+      // Relevance sweep exhausted — hand off to the date sweep (same query
+      // list, re-sorted) if enabled, otherwise this phase is done.
+      if (dateSweep && subphase === 'relevance') {
+        subphase = 'date';
+        idx = 0;
+        continue;
+      }
+      break;
+    }
+
     if (Date.now() - startTime > CRAWL2_TIME_LIMIT_MS) {
-      props.setProperty('CRAWL2_KEYWORD_IDX', String(idx));
-      props.setProperty('CRAWL2_KEYWORD_COLLECTED', String(collected));
-      return { status: 'time-limit', message: 'Keyword pass — time limit reached. ' + collected +
-             ' seed(s) collected so far (' + idx + '/' + queries.length + ' queries run).' };
+      persistProgress();
+      return { status: 'time-limit', message: 'Keyword pass (' + subphase + ' sweep) — time limit reached. ' +
+             collected + ' seed(s) collected so far (' + idx + '/' + queries.length + ' queries this sweep).' };
     }
 
     var query   = queries[idx++];
     var results = [];
-    try { results = s2SearchPapers(query, KEYWORD_RESULTS_PER_QUERY); } catch (e) { /* skip a failed query */ }
+    if (paginated) {
+      var token = null;
+      for (var page = 0; page < pagesPerQuery; page++) {
+        var pageResult = s2BulkSearch({
+          query: query,
+          sort:  subphase === 'date' ? 'publicationDate:desc' : null,
+          token: token
+        });
+        queriesIssued++;
+        results = results.concat(pageResult.data);
+        if (!pageResult.token) break;
+        token = pageResult.token;
+        Utilities.sleep(1100);
+      }
+    } else {
+      try { results = s2SearchPapers(query, KEYWORD_RESULTS_PER_QUERY); } catch (e) { /* skip a failed query */ }
+      queriesIssued++;
+    }
+    resultsSeen += results.length;
     Utilities.sleep(1100); // same S2 pacing used elsewhere in the project
 
     var newRows  = [];
@@ -580,7 +867,7 @@ function runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCe
         note = describeAbstractSource(lookup); // from crawl.js
       }
 
-      var yearOk  = isYearInBounds(paper.year, yearFloor, yearCeiling, yearBound); // from crawl.js
+      var yearOk  = effectiveYearBound ? isYearInBounds(paper.year, yearFloor, yearCeiling, effectiveYearBound) : true; // from crawl.js
       var verdict = jsMatchesFilterV2((paper.title || '') + ' ' + abstract, groups);
       // The keyword pass only ever keeps genuine seeds — there's no "queue"
       // to record a dead-end non-match against the way forward/backward do,
@@ -604,10 +891,25 @@ function runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCe
     }
   }
 
-  props.setProperty('CRAWL2_KEYWORD_IDX', String(idx));
-  props.setProperty('CRAWL2_KEYWORD_COLLECTED', String(collected));
-  return { status: 'complete', message: 'Keyword pass complete. ' + collected +
-         ' seed paper(s) collected from ' + idx + ' quer' + (idx === 1 ? 'y' : 'ies') + '.' };
+  persistProgress();
+
+  var summary = 'Keyword pass complete. ' + collected + ' seed paper(s) collected from ' +
+    queriesIssued + ' quer' + (queriesIssued === 1 ? 'y call' : 'y calls') + ' (' + resultsSeen + ' results seen)' +
+    (dateSweep ? ', relevance + date sweeps' : '') + '.';
+
+  // Required instrumentation, not optional (the brief's own framing): fail
+  // loudly rather than silently proceeding when the shortfall is large —
+  // a 14% yield (280/2000) passed silently in v19 straight into backward/forward.
+  if (collected < targetSeeds * shortfallTolerance) {
+    return { status: 'shortfall', message: 'Keyword pass shortfall: only ' + collected + ' of ' + targetSeeds +
+           ' target seeds collected (' + Math.round(100 * collected / targetSeeds) + '%, below the ' +
+           Math.round(100 * shortfallTolerance) + '% tolerance) from ' + queriesIssued + ' quer' +
+           (queriesIssued === 1 ? 'y call' : 'y calls') + ' (' + resultsSeen + ' results seen). Stopped rather than ' +
+           'continuing to backward/forward with a thin seed set — review the filter groups or query construction, ' +
+           'then click Resume v2 Crawl to continue anyway.' };
+  }
+
+  return { status: 'complete', message: summary };
 }
 
 // ============================================================
@@ -625,12 +927,32 @@ function runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCe
 // live formula column — the live formula only reflects reality once Apply
 // Highlight Rule has been run, so re-deriving it in-memory is the more
 // robust source of truth for phase-gating.
-// ============================================================
-
-function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound) {
+//
+// Already scans the WHOLE sheet regardless of Direction (K/B/F all
+// eligible as long as Filter Match=TRUE and depth < maxDepth) — this is
+// also what makes a "second pass after forward" (v3 §4/§7.2, sign-off:
+// sequential, not interleaved) trivial to add: the SAME function, called
+// again with a different propPrefix so its own resumability state doesn't
+// collide with the first pass, naturally picks up every F-discovered match
+// forward produced, on top of whatever it already covered. It also
+// re-examines K/B parents already processed in pass 1 (a real but accepted
+// inefficiency — avoiding that would need a persistent "already a backward
+// source" ID set threaded across passes, more complexity than the brief's
+// "add a second pass" ask calls for).
+//
+// propPrefix namespaces this pass's own resumability + instrumentation
+// properties — 'CRAWL2_BACKWARD' for pass 1 (unchanged), 'CRAWL2_BACKWARD2'
+// for the optional second pass.
+function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, propPrefix) {
+  propPrefix = propPrefix || 'CRAWL2_BACKWARD';
   var startTime = Date.now();
   var props     = PropertiesService.getScriptProperties();
-  var idx       = parseInt(props.getProperty('CRAWL2_BACKWARD_IDX') || '0');
+  var idx       = parseInt(props.getProperty(propPrefix + '_IDX') || '0');
+  // Reject-counting (v3 §4: "a per-parent count of references examined vs
+  // kept, so the phase has a measurable hit rate") — aggregate, not
+  // per-parent-logged, per the brief's own "at minimum" allowance.
+  var examined  = parseInt(props.getProperty(propPrefix + '_EXAMINED') || '0');
+  var kept      = parseInt(props.getProperty(propPrefix + '_KEPT')     || '0');
 
   var lastRow = getCrawlLastDataRow(sheet);
   if (lastRow < 3) return { status: 'complete', message: 'Backward pass complete. No papers found.' };
@@ -656,10 +978,16 @@ function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCe
     paperDepths.push(depth);
   });
 
+  function persistProgress() {
+    props.setProperty(propPrefix + '_IDX', String(idx));
+    props.setProperty(propPrefix + '_EXAMINED', String(examined));
+    props.setProperty(propPrefix + '_KEPT', String(kept));
+  }
+
   var processed = 0;
   while (idx < paperIds.length) {
     if (Date.now() - startTime > CRAWL2_TIME_LIMIT_MS) {
-      props.setProperty('CRAWL2_BACKWARD_IDX', String(idx));
+      persistProgress();
       updateCrawlMatchedCites(sheet); // from crawl.js
       return { status: 'time-limit', message: 'Backward pass — time limit reached. Processed ' + processed +
              '; ' + (paperIds.length - idx) + ' remain.' };
@@ -676,6 +1004,7 @@ function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCe
       markFetchFailure(sheet, paperSheetRow, e); // from crawl.js
       continue;
     }
+    examined += refs.length;
 
     var newRows  = [];
     var newNotes = [];
@@ -704,6 +1033,7 @@ function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCe
       newRows.push(crawlRowFromS2(ref, paperDepth + 1, paperId, 'B')); // from crawl.js
       newNotes.push(note);
       newFlags.push(verdict.flagged);
+      kept++;
     });
 
     if (newRows.length > 0) {
@@ -715,9 +1045,11 @@ function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCe
     }
   }
 
-  props.setProperty('CRAWL2_BACKWARD_IDX', String(idx));
+  persistProgress();
   updateCrawlMatchedCites(sheet);
-  return { status: 'complete', message: 'Backward pass complete. Processed ' + processed + ' matching paper(s).' };
+  return { status: 'complete', message: 'Backward pass complete. Processed ' + processed + ' matching paper(s), ' +
+         'examined ' + examined + ' reference(s), kept ' + kept +
+         ' (' + (examined > 0 ? Math.round(100 * kept / examined) : 0) + '% hit rate).' };
 }
 
 // ============================================================
@@ -881,7 +1213,10 @@ function runAbstractRetrySweep(sheet, startIdx) {
 
 // ============================================================
 // Background batch handler — the v2 trigger entry point.
-// Phase order: keyword → backward (if enabled) → forward → sweep → complete.
+// Phase order (v3): venue (if enabled) → keyword → backward (if enabled)
+// → forward → backward2 (if enabled) → sweep → complete. Every new phase
+// is opt-in and off by default — a run with all v3 options left off
+// reproduces the v19 order exactly (keyword → backward → forward → sweep).
 // ============================================================
 
 function crawlV2BatchTrigger() {
@@ -909,13 +1244,50 @@ function crawlV2BatchTrigger() {
     var targetSeeds = parseInt(props.getProperty('CRAWL2_TARGET_SEEDS') || String(KEYWORD_SEARCH_TARGET_DEFAULT));
     var logRow      = parseInt(props.getProperty('CRAWL2_LOG_ROW') || '0') || 0;
 
+    // v3 opt-in options — all default off/unset, reproducing v19 exactly.
+    var phase0Enabled  = props.getProperty('CRAWL2_PHASE0_ENABLED') === 'true';
+    var phase0Venues   = JSON.parse(props.getProperty('CRAWL2_PHASE0_VENUES') || '[]');
+    var phase0YearFrom = parseInt(props.getProperty('CRAWL2_PHASE0_YEAR_FROM') || String(PHASE0_YEAR_FROM_DEFAULT));
+    var phase0YearTo   = parseInt(props.getProperty('CRAWL2_PHASE0_YEAR_TO')   || String(PHASE0_YEAR_TO_DEFAULT));
+    var phase2Second   = props.getProperty('CRAWL2_PHASE2_SECOND_PASS') === 'true';
+    var keywordOpts = {
+      paginated:          props.getProperty('CRAWL2_PHASE1_PAGINATED') === 'true',
+      pagesPerQuery:      parseInt(props.getProperty('CRAWL2_PHASE1_PAGES_PER_QUERY') || String(PHASE1_PAGES_PER_QUERY_DEFAULT)),
+      dateSweep:          props.getProperty('CRAWL2_PHASE1_DATE_SWEEP') === 'true',
+      noYearFloor:        props.getProperty('CRAWL2_PHASE1_NO_YEAR_FLOOR') === 'true',
+      maxQueries:         parseInt(props.getProperty('CRAWL2_PHASE1_MAX_QUERIES') || '0') || 0,
+      shortfallTolerance: parseFloat(props.getProperty('CRAWL2_PHASE1_SHORTFALL_TOLERANCE') || String(PHASE1_SHORTFALL_TOLERANCE_DEFAULT))
+    };
+
     var result;
 
-    if (phase === 'keyword') {
-      setCrawlStatus(sheet, 'Keyword pass — batch ' + batch + '…');
-      result = runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCeiling, yearBound);
+    if (phase === 'venue') {
+      setCrawlStatus(sheet, 'Venue sweep — batch ' + batch + '…');
+      result = runVenueSweep(sheet, groups, phase0Venues, phase0YearFrom, phase0YearTo, maxPapers);
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
+        setCrawlStatus(sheet, result.message);
+      } else if (result.status === 'paper-limit') {
+        deleteCrawlV2Trigger();
+        setCrawlStatus(sheet, result.message);
+      } else {
+        props.setProperty('CRAWL2_PHASE', 'keyword');
+        props.setProperty('CRAWL2_BATCH_NUM', '1');
+        setCrawlStatus(sheet, result.message + ' — starting keyword pass…');
+      }
+
+    } else if (phase === 'keyword') {
+      setCrawlStatus(sheet, 'Keyword pass — batch ' + batch + '…');
+      result = runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCeiling, yearBound, keywordOpts);
+      if (result.status === 'time-limit') {
+        props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
+        setCrawlStatus(sheet, result.message);
+      } else if (result.status === 'shortfall') {
+        // Required instrumentation (v3 §4): stop rather than cascade into
+        // backward/forward with a thin seed set — resumable, same
+        // "Resume v2 Crawl continues anyway" convention as Paper Limit.
+        deleteCrawlV2Trigger();
+        updateLogRow(logRow, 'Shortfall');
         setCrawlStatus(sheet, result.message);
       } else {
         props.setProperty('CRAWL2_PHASE', runBackward ? 'backward' : 'forward');
@@ -925,7 +1297,7 @@ function crawlV2BatchTrigger() {
 
     } else if (phase === 'backward') {
       setCrawlStatus(sheet, 'Backward pass — batch ' + batch + '…');
-      result = runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound);
+      result = runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD');
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
@@ -943,6 +1315,21 @@ function crawlV2BatchTrigger() {
         setCrawlStatus(sheet, result.message);
       } else if (result.status === 'paper-limit') {
         deleteCrawlV2Trigger();
+        setCrawlStatus(sheet, result.message);
+      } else if (phase2Second) {
+        props.setProperty('CRAWL2_PHASE', 'backward2');
+        props.setProperty('CRAWL2_BATCH_NUM', '1');
+        setCrawlStatus(sheet, result.message + ' — starting second backward pass (v3, over the now-larger match set)…');
+      } else {
+        props.setProperty('CRAWL2_PHASE', 'sweep');
+        setCrawlStatus(sheet, result.message + ' — running final abstract retry sweep…');
+      }
+
+    } else if (phase === 'backward2') {
+      setCrawlStatus(sheet, 'Second backward pass — batch ' + batch + '…');
+      result = runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD2');
+      if (result.status === 'time-limit') {
+        props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
       } else {
         props.setProperty('CRAWL2_PHASE', 'sweep');
@@ -1005,6 +1392,21 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
     // toggleable off for a keyword+forward-only comparison run.
     var runBackward = opts.runBackward !== false;
 
+    // v3 additions — all default off/unset, so a plain call reproduces
+    // today's (v19) pipeline exactly (§0.2 of the v3 brief).
+    var phase0Enabled  = !!opts.phase0Enabled;
+    var phase0Venues   = Array.isArray(opts.phase0Venues) ? opts.phase0Venues : [];
+    var phase0YearFrom = parseInt(opts.phase0YearFrom) || PHASE0_YEAR_FROM_DEFAULT;
+    var phase0YearTo   = parseInt(opts.phase0YearTo)   || PHASE0_YEAR_TO_DEFAULT;
+    var phase1Paginated          = !!opts.phase1Paginated;
+    var phase1PagesPerQuery      = parseInt(opts.phase1PagesPerQuery) || PHASE1_PAGES_PER_QUERY_DEFAULT;
+    var phase1DateSweep          = !!opts.phase1DateSweep;
+    var phase1NoYearFloor        = !!opts.phase1NoYearFloor;
+    var phase1MaxQueries         = parseInt(opts.phase1MaxQueries) || 0; // 0 = let runKeywordPass pick its own default
+    var phase1ShortfallTolerance = (opts.phase1ShortfallTolerance != null && opts.phase1ShortfallTolerance !== '')
+      ? parseFloat(opts.phase1ShortfallTolerance) : PHASE1_SHORTFALL_TOLERANCE_DEFAULT;
+    var phase2SecondPass = !!opts.phase2SecondPass;
+
     seeds = seeds || [];
 
     var seedYears = seeds
@@ -1032,7 +1434,9 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
     props.setProperty('CRAWL2_MAX_PAPERS',      String(maxPapers || 300));
     props.setProperty('CRAWL2_TARGET_SEEDS',    String(targetN));
     props.setProperty('CRAWL2_FILTER_GROUPS',   JSON.stringify(groups)); // v2's OWN key — not shared with v1/Snowball
-    props.setProperty('CRAWL2_PHASE',           'keyword');
+    // Phase 0 is a genuinely new entry point ahead of keyword when enabled;
+    // otherwise the pipeline starts exactly where v19 did.
+    props.setProperty('CRAWL2_PHASE',           phase0Enabled ? 'venue' : 'keyword');
     props.setProperty('CRAWL2_MATCHES_ONLY',    matchesOnly ? 'true' : 'false');
     props.setProperty('CRAWL2_RUN_BACKWARD',    runBackward ? 'true' : 'false');
     props.setProperty('CRAWL2_YEAR_BOUND',      yearBound   ? 'true' : 'false');
@@ -1040,10 +1444,34 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
     props.setProperty('CRAWL2_YEAR_CEILING',    String(yearCeiling));
     props.setProperty('CRAWL2_KEYWORD_IDX',       '0');
     props.setProperty('CRAWL2_KEYWORD_COLLECTED', '0');
+    props.setProperty('CRAWL2_KEYWORD_SUBPHASE',        'relevance');
+    props.setProperty('CRAWL2_KEYWORD_QUERIES_ISSUED',  '0');
+    props.setProperty('CRAWL2_KEYWORD_RESULTS_SEEN',    '0');
     props.setProperty('CRAWL2_BACKWARD_IDX',      '0');
+    props.setProperty('CRAWL2_BACKWARD_EXAMINED', '0');
+    props.setProperty('CRAWL2_BACKWARD_KEPT',     '0');
+    props.setProperty('CRAWL2_BACKWARD2_IDX',      '0');
+    props.setProperty('CRAWL2_BACKWARD2_EXAMINED', '0');
+    props.setProperty('CRAWL2_BACKWARD2_KEPT',     '0');
     props.setProperty('CRAWL2_SWEEP_IDX',         '0');
     props.setProperty('CRAWL2_SWEEP_RECOVERED',   '0');
     props.setProperty('CRAWL2_BATCH_NUM',         '1');
+
+    // v3 option persistence — read fresh by crawlV2BatchTrigger every firing.
+    props.setProperty('CRAWL2_PHASE0_ENABLED',   phase0Enabled ? 'true' : 'false');
+    props.setProperty('CRAWL2_PHASE0_VENUES',    JSON.stringify(phase0Venues));
+    props.setProperty('CRAWL2_PHASE0_YEAR_FROM', String(phase0YearFrom));
+    props.setProperty('CRAWL2_PHASE0_YEAR_TO',   String(phase0YearTo));
+    props.setProperty('CRAWL2_VENUE_BATCH_IDX',  '0');
+    props.setProperty('CRAWL2_VENUE_TOKEN',      '');
+    props.setProperty('CRAWL2_VENUE_COUNT',      '0');
+    props.setProperty('CRAWL2_PHASE1_PAGINATED',            phase1Paginated ? 'true' : 'false');
+    props.setProperty('CRAWL2_PHASE1_PAGES_PER_QUERY',      String(phase1PagesPerQuery));
+    props.setProperty('CRAWL2_PHASE1_DATE_SWEEP',           phase1DateSweep ? 'true' : 'false');
+    props.setProperty('CRAWL2_PHASE1_NO_YEAR_FLOOR',        phase1NoYearFloor ? 'true' : 'false');
+    props.setProperty('CRAWL2_PHASE1_MAX_QUERIES',          String(phase1MaxQueries));
+    props.setProperty('CRAWL2_PHASE1_SHORTFALL_TOLERANCE',  String(phase1ShortfallTolerance));
+    props.setProperty('CRAWL2_PHASE2_SECOND_PASS', phase2SecondPass ? 'true' : 'false');
 
     var logRow = appendLogRow('CrawlV2', {
       name:          sheetName,
@@ -1072,10 +1500,10 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
     }
 
     ss.setActiveSheet(sheet);
-    applyCrawlV2Highlight(sheet, groups); // three-state Full/Partial/No Match, not v1's boolean version
+    applyCrawlV2Highlight(sheet, groups); // boolean K + green/orange row highlight, not v1's plain green rule
 
     createCrawlV2Trigger();
-    setCrawlStatus(sheet, 'Running keyword pass batch 1…');
+    setCrawlStatus(sheet, phase0Enabled ? 'Running venue sweep batch 1…' : 'Running keyword pass batch 1…');
 
     return 'Crawl v2 started — running in the background. Watch the "Crawl Status" cell at the top of the sheet. You can close this panel.';
 
@@ -1093,10 +1521,10 @@ function resumeCrawlV2() {
     if (!sheet) return 'Crawl sheet "' + sheetName + '" not found — it may have been deleted.';
 
     var phase = props.getProperty('CRAWL2_PHASE') || 'keyword';
-    // Only forward/backward have a real Crawled=FALSE queue to check for
-    // emptiness — keyword and sweep track progress via their own idx
-    // properties and are resumable regardless of countUncrawled().
-    if ((phase === 'forward' || phase === 'backward') && countUncrawled(sheet) === 0) {
+    // Only forward/backward/backward2 have a real Crawled=FALSE queue to
+    // check for emptiness — venue/keyword/sweep track progress via their
+    // own idx properties and are resumable regardless of countUncrawled().
+    if ((phase === 'forward' || phase === 'backward' || phase === 'backward2') && countUncrawled(sheet) === 0) {
       return 'Crawl v2 "' + sheetName + '" has nothing left to process in this phase — it may already be complete.';
     }
 
@@ -1120,7 +1548,7 @@ function applyCrawlV2Filter(groups) {
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
     if (!sheet) return 'Crawl sheet "' + sheetName + '" not found.';
     props.setProperty('CRAWL2_FILTER_GROUPS', JSON.stringify(groups));
-    applyCrawlV2Highlight(sheet, groups); // three-state Full/Partial/No Match, not v1's boolean version
+    applyCrawlV2Highlight(sheet, groups); // boolean K + green/orange row highlight, not v1's plain green rule
     return 'Highlight rule updated on "' + sheetName + '".';
   } catch (e) {
     return 'Error: ' + e.message;

@@ -133,11 +133,12 @@ function appendLogRow(type, data) {
 
 // True for any status that means the trigger has stopped running — as
 // opposed to "Running" / in-progress batch messages like "batch 3 done,
-// batch 4 starting…". Paper Limit counts as terminal even though it's
-// resumable, since the crawl genuinely stops until a manual Resume.
+// batch 4 starting…". Paper Limit and Shortfall (v3's keyword-pass
+// shortfall stop) count as terminal even though they're resumable, since
+// the crawl genuinely stops until a manual Resume.
 function isTerminalStatus_(status) {
   return status === 'Complete' || status === 'Cancelled' || status === 'Paper Limit' ||
-         status.indexOf('Error') !== -1;
+         status === 'Shortfall' || status.indexOf('Error') !== -1;
 }
 
 // Updates the Status cell and its colour for a given log row number.
@@ -161,7 +162,7 @@ function setLogStatusStyle_(sheet, rowNum, status) {
     cell.setBackground('#34a853').setFontColor('#ffffff');
   } else if (status.indexOf('Error') !== -1) {
     cell.setBackground('#e53935').setFontColor('#ffffff');
-  } else if (status === 'Paper Limit') {
+  } else if (status === 'Paper Limit' || status === 'Shortfall') {
     cell.setBackground('#ff9800').setFontColor('#ffffff');
   } else if (status === 'Cancelled') {
     cell.setBackground('#9e9e9e').setFontColor('#ffffff');

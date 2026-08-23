@@ -186,9 +186,9 @@
   <body>
 
     <p class="hint" style="margin-bottom:10px;">
-      <strong>Citation Crawl v2</strong><span class="badge">BETA</span> — pipeline runs
-      Keyword pass → Backward pass → Forward pass. Runs alongside (not instead of) the
-      original Citation Crawl, in its own sheet.
+      <strong>Citation Crawl</strong> — pipeline runs Venue sweep → Keyword pass → Backward pass
+      → Forward pass → Backward pass (again) → final abstract retry sweep, each writing to its
+      own sheet.
     </p>
 
     <!-- ── Resume code paste bar ── -->
@@ -230,24 +230,64 @@
       </div>
       <div class="section-body" id="settingsBody">
         <p class="hint">Name this crawl — it becomes the sheet tab name.</p>
-        <input type="text" id="crawlName" placeholder="e.g. K12 Physical Computing 2024 (v2)">
+        <input type="text" id="crawlName" placeholder="e.g. K12 Physical Computing 2024">
 
         <p class="hint">
-          <strong>Phase 1 — Keyword pass.</strong> Target number of seed papers to collect via
-          Semantic Scholar search before moving to the backward pass. Combines terms across your
-          positive filter groups below into search queries automatically.
+          <strong>Phase 0 — Venue sweep.</strong> Enumerates the full publication record of these
+          venues (comma or newline separated — matched fuzzily against Semantic Scholar's own
+          venue names, e.g. "SIGCSE" alone matches its full canonical name) within the year
+          window, through the filter below. Leave the list empty to skip straight to the keyword
+          pass.
+        </p>
+        <textarea id="phase0Venues" rows="3"
+          style="width:100%;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:11px;font-family:monospace;margin-bottom:8px;"
+        >IDC, WiPSCE, Koli Calling, TOCE, ICER V.2, SIGCSE V.2, CHI, ITiCSE, SIGCITE</textarea>
+        <div class="limits-row">
+          <div>
+            <label>Venue sweep: year from</label>
+            <input type="number" id="phase0YearFrom" value="2023">
+          </div>
+          <div>
+            <label>Venue sweep: year to</label>
+            <input type="number" id="phase0YearTo" value="2026">
+          </div>
+        </div>
+
+        <p class="hint">
+          <strong>Phase 1 — Keyword pass.</strong> Target seed count via paginated Semantic
+          Scholar search (a relevance-sorted sweep and a date-sorted sweep, no year floor of its
+          own) — combines terms across your positive filter groups below automatically.
         </p>
         <div class="limits-row">
           <div>
             <label>Target seed count</label>
             <input type="number" id="crawlTargetSeeds" value="200" min="10" max="1000">
           </div>
+          <div>
+            <label>Pages per query</label>
+            <input type="number" id="phase1PagesPerQuery" value="3" min="1" max="10">
+          </div>
         </div>
+        <div class="limits-row">
+          <div>
+            <label>Max queries (optional)</label>
+            <input type="number" id="phase1MaxQueries" placeholder="800 default">
+          </div>
+          <div>
+            <label>Shortfall tolerance (%)</label>
+            <input type="number" id="phase1ShortfallTolerance" value="50" min="1" max="100">
+          </div>
+        </div>
+        <p class="hint">
+          If the keyword pass collects fewer seeds than this percentage of the target, the crawl
+          stops with a "Shortfall" status instead of silently continuing to backward/forward with
+          a thin seed set — click "Resume v2 Crawl" to continue anyway once reviewed.
+        </p>
 
         <div class="limits-row">
           <div>
             <label>Max depth</label>
-            <input type="number" id="crawlMaxDepth" value="3" min="1" max="5">
+            <input type="number" id="crawlMaxDepth" value="2" min="1" max="5">
           </div>
           <div>
             <label>Max papers</label>
@@ -276,22 +316,19 @@
               </div>
             </div>
           </div>
-          <div class="check-row">
-            <input type="checkbox" id="runBackwardCheck" checked>
-            <label for="runBackwardCheck">Phase 2 — Run backward pass (references of every keyword-pass match) before the forward pass</label>
-          </div>
         </div>
 
         <p class="hint">
-          <strong>NOT-groups no longer exclude outright.</strong> A paper that matches every
-          positive filter group is kept even if a NOT-group also matched — the row highlights
-          orange instead of green, and the Filter Match cell gets a note explaining why, rather
-          than the paper being silently dropped or its title being altered.
+          <strong>Pipeline order is fixed:</strong> venue sweep → keyword pass → backward pass →
+          forward pass → second backward pass → final abstract retry sweep. Backward runs
+          twice — once over the venue/keyword seeds, again after forward completes so
+          forward-discovered matches get their own references pulled too. None of these phases
+          are optional any more; they're the default pipeline.
         </p>
         <p class="hint">
-          Backward pass runs to the same "Max depth" as the forward pass (not a separate,
-          smaller cap) — only papers whose Filter Match is TRUE expand backward, matching the
-          forward pass's own gate.
+          Backward runs to the same "Max depth" as forward — only papers whose Filter Match is
+          TRUE expand (REVIEW rows are harvested but never expanded either direction — see the
+          Filter section below).
         </p>
         <p class="hint">
           Abstract resolution stays Semantic Scholar + OpenAlex only, but persists for longer
@@ -311,95 +348,26 @@
       <div class="section-body" id="filterBody">
         <p class="hint">
           Each card is an <strong>AND</strong> condition; terms within a card are <strong>OR</strong>'d.
-          Tick <strong>NOT</strong> for a group whose hits get flagged rather than excluded (see above).
-          At least one non-NOT group with terms is required — the keyword pass searches on these.
+          Tick <strong>NOT</strong> for a group, then choose what tripping it means: <strong>Exclude</strong>
+          (hard veto — Filter Match becomes FALSE) or <strong>Flag for review</strong> (Filter Match
+          becomes REVIEW — the paper is kept and harvested, but never queued for backward/forward
+          expansion, pending human triage). At least one non-NOT group with terms is required —
+          the keyword pass searches on these.
         </p>
         <div id="groupsContainer"></div>
         <button id="addGroupBtn" onclick="addGroup()">+ Add AND Group</button>
-        <button id="filterBtn"   onclick="applyFilter()">Apply Highlight Rule</button>
-      </div>
-    </div>
 
-    <!-- ── Section 4: v3 Options (all off by default) ── -->
-    <div class="section">
-      <div class="section-header toggle" id="v3Header"
-           onclick="toggleSection('v3Body','v3Header')">
-        4. v3 Options <span class="badge">BETA</span> <span class="chevron">▶</span>
-      </div>
-      <div class="section-body collapsed" id="v3Body">
-        <p class="hint">
-          Everything below is additive and off by default — leaving all of it unchecked reproduces
-          today's pipeline exactly (keyword → backward → forward).
+        <p class="hint" style="margin-top:10px;">
+          <strong>Guard phrases</strong> (optional, comma or newline separated): suppresses a term
+          match when its only occurrence is inside one of these phrases — e.g. add
+          <code>from scratch</code> so a bare "Scratch" term doesn't match "trained from scratch".
         </p>
+        <textarea id="guardPhrases" rows="2"
+          style="width:100%;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:11px;font-family:monospace;margin-bottom:8px;"
+          placeholder="from scratch, trained from scratch, built from scratch, starting from scratch"
+        ></textarea>
 
-        <div class="back-options">
-          <div class="check-row">
-            <input type="checkbox" id="phase0Check" onchange="togglePhase0()">
-            <label for="phase0Check">Phase 0 — Venue enumeration sweep, runs before the keyword pass</label>
-          </div>
-          <div class="check-sub" id="phase0Row" style="display:none">
-            <p class="hint" style="margin-top:6px;">
-              Enumerates the full publication record of these venues (comma or newline separated —
-              matched fuzzily against Semantic Scholar's own venue names) within the year window,
-              through the same filter. Pre-filled with the brief's a-priori list; add more venues
-              from your own prior runs as needed.
-            </p>
-            <textarea id="phase0Venues" rows="3"
-              style="width:100%;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:11px;font-family:monospace;margin-bottom:8px;"
-            >IDC, WiPSCE, Koli Calling, TOCE, ICER V.2, SIGCSE V.2</textarea>
-            <div class="limits-row">
-              <div>
-                <label>Year from</label>
-                <input type="number" id="phase0YearFrom" value="2023">
-              </div>
-              <div>
-                <label>Year to</label>
-                <input type="number" id="phase0YearTo" value="2026">
-              </div>
-            </div>
-          </div>
-
-          <div class="check-row">
-            <input type="checkbox" id="phase1PaginatedCheck" onchange="togglePhase1Paginated()">
-            <label for="phase1PaginatedCheck">Phase 1 — Paginated keyword search (bulk endpoint, several pages per query instead of one)</label>
-          </div>
-          <div class="check-sub" id="phase1PaginatedRow" style="display:none">
-            <div class="limits-row">
-              <div>
-                <label>Pages per query</label>
-                <input type="number" id="phase1PagesPerQuery" value="3" min="1" max="10">
-              </div>
-              <div>
-                <label>Max queries (optional)</label>
-                <input type="number" id="phase1MaxQueries" placeholder="800 default">
-              </div>
-            </div>
-            <div class="check-row">
-              <input type="checkbox" id="phase1DateSweepCheck">
-              <label for="phase1DateSweepCheck">Also run a second sweep sorted by publication date (catches recent, low-citation papers the relevance sweep ranks poorly)</label>
-            </div>
-          </div>
-          <div class="check-row">
-            <input type="checkbox" id="phase1NoYearFloorCheck">
-            <label for="phase1NoYearFloorCheck">Phase 1 — No year floor (ignore "Bound corpus by seed year" for the keyword pass specifically)</label>
-          </div>
-          <div class="limits-row">
-            <div>
-              <label>Phase 1 shortfall tolerance (%)</label>
-              <input type="number" id="phase1ShortfallTolerance" value="50" min="1" max="100">
-            </div>
-          </div>
-          <p class="hint">
-            If the keyword pass collects fewer seeds than this percentage of the target, the crawl
-            stops with a "Shortfall" status instead of silently continuing to backward/forward with
-            a thin seed set — click "Resume v2 Crawl" to continue anyway once reviewed.
-          </p>
-
-          <div class="check-row">
-            <input type="checkbox" id="phase2SecondPassCheck">
-            <label for="phase2SecondPassCheck">Phase 2 — Run a second backward pass after forward completes (pulls references for forward-discovered matches too, not just keyword-pass seeds)</label>
-          </div>
-        </div>
+        <button id="filterBtn"   onclick="applyFilter()">Apply Highlight Rule</button>
       </div>
     </div>
 
@@ -702,63 +670,47 @@
         document.getElementById('yearRangeRow').style.display = show ? 'block' : 'none';
       }
 
-      // ── v3 option toggles ────────────────────────────────────────
-      function togglePhase0() {
-        var show = document.getElementById('phase0Check').checked;
-        document.getElementById('phase0Row').style.display = show ? 'block' : 'none';
-      }
-
-      function togglePhase1Paginated() {
-        var show = document.getElementById('phase1PaginatedCheck').checked;
-        document.getElementById('phase1PaginatedRow').style.display = show ? 'block' : 'none';
-        // Date-sort sorting is only meaningful via the paginated bulk
-        // endpoint — S2's plain relevance search has no sort param.
-        if (!show) document.getElementById('phase1DateSweepCheck').checked = false;
-      }
-
-      // Splits a textarea's comma/newline-separated venue list into a
-      // trimmed, non-empty string array.
-      function parseVenueList(raw) {
+      // Splits a textarea's comma/newline-separated list (venues, guard
+      // phrases) into a trimmed, non-empty string array.
+      function parseCommaOrNewlineList(raw) {
         return (raw || '').split(/[,\n]/).map(function(v) { return v.trim(); }).filter(Boolean);
+      }
+
+      // Shows/hides a group's "when tripped" mode selector alongside its
+      // NOT checkbox — exclude (hard veto) vs review (kept, flagged,
+      // never expanded).
+      function onNotToggle(checkboxEl) {
+        var card = checkboxEl.closest('.group-card');
+        card.querySelector('.not-mode-row').style.display = checkboxEl.checked ? 'block' : 'none';
+        updateStartButtonState();
       }
 
       // ── Start / Resume ────────────────────────────────────────
       function startCrawl() {
         var crawlName     = document.getElementById('crawlName').value.trim();
-        var maxDepth      = parseInt(document.getElementById('crawlMaxDepth').value)  || 3;
+        var maxDepth      = parseInt(document.getElementById('crawlMaxDepth').value)  || 2;
         var maxPapers     = parseInt(document.getElementById('crawlMaxPapers').value) || 300;
         var targetSeeds   = parseInt(document.getElementById('crawlTargetSeeds').value) || 200;
         var groups        = getGroupsFromPanel();
+        var guardPhrases  = parseCommaOrNewlineList(document.getElementById('guardPhrases').value);
         var matchesOnly   = document.getElementById('matchesOnlyCheck').checked;
         var yearBound     = document.getElementById('yearBoundCheck').checked;
         var yearFrom      = parseInt(document.getElementById('crawlYearFrom').value) || 0;
         var yearTo        = parseInt(document.getElementById('crawlYearTo').value)   || 0;
-        var runBackward   = document.getElementById('runBackwardCheck').checked;
 
-        // v3 options — all off/default unless explicitly checked, so a
-        // plain run reproduces today's pipeline exactly.
-        var phase0Enabled  = document.getElementById('phase0Check').checked;
-        var phase0Venues   = parseVenueList(document.getElementById('phase0Venues').value);
+        var phase0Venues   = parseCommaOrNewlineList(document.getElementById('phase0Venues').value);
         var phase0YearFrom = parseInt(document.getElementById('phase0YearFrom').value) || 2023;
         var phase0YearTo   = parseInt(document.getElementById('phase0YearTo').value)   || 2026;
-        var phase1Paginated          = document.getElementById('phase1PaginatedCheck').checked;
         var phase1PagesPerQuery      = parseInt(document.getElementById('phase1PagesPerQuery').value) || 3;
-        var phase1DateSweep          = document.getElementById('phase1DateSweepCheck').checked;
-        var phase1NoYearFloor        = document.getElementById('phase1NoYearFloorCheck').checked;
         var phase1MaxQueriesRaw      = document.getElementById('phase1MaxQueries').value.trim();
         var phase1MaxQueries         = phase1MaxQueriesRaw ? (parseInt(phase1MaxQueriesRaw) || 0) : 0;
         var phase1ShortfallTolerance = (parseInt(document.getElementById('phase1ShortfallTolerance').value) || 50) / 100;
-        var phase2SecondPass = document.getElementById('phase2SecondPassCheck').checked;
 
         if (!crawlName) { setStatus('Please enter a name for this crawl.'); return; }
         var hasPositiveGroup = groups.some(function(g) { return !g.not && g.terms; });
         if (!hasPositiveGroup) { setStatus('Please add at least one non-NOT filter group with terms — the keyword pass searches on these.'); return; }
         if (yearFrom && yearTo && yearFrom > yearTo) {
           setStatus('"From year" must be less than or equal to "To year".');
-          return;
-        }
-        if (phase0Enabled && phase0Venues.length === 0) {
-          setStatus('Phase 0 is checked but no venues are listed — add at least one, or uncheck Phase 0.');
           return;
         }
 
@@ -769,13 +721,10 @@
           .withFailureHandler(function(err) { setStatus('Error: ' + err.message); setLoading(false); })
           .startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName,
                         { matchesOnly: matchesOnly, yearBound: yearBound, yearFrom: yearFrom, yearTo: yearTo,
-                          runBackward: runBackward,
-                          phase0Enabled: phase0Enabled, phase0Venues: phase0Venues,
-                          phase0YearFrom: phase0YearFrom, phase0YearTo: phase0YearTo,
-                          phase1Paginated: phase1Paginated, phase1PagesPerQuery: phase1PagesPerQuery,
-                          phase1DateSweep: phase1DateSweep, phase1NoYearFloor: phase1NoYearFloor,
-                          phase1MaxQueries: phase1MaxQueries, phase1ShortfallTolerance: phase1ShortfallTolerance,
-                          phase2SecondPass: phase2SecondPass });
+                          guardPhrases: guardPhrases,
+                          phase0Venues: phase0Venues, phase0YearFrom: phase0YearFrom, phase0YearTo: phase0YearTo,
+                          phase1PagesPerQuery: phase1PagesPerQuery, phase1MaxQueries: phase1MaxQueries,
+                          phase1ShortfallTolerance: phase1ShortfallTolerance });
       }
 
       function resumeCrawl() {
@@ -790,13 +739,14 @@
       // ── Filter ────────────────────────────────────────────────
       function applyFilter() {
         var groups = getGroupsFromPanel();
+        var guardPhrases = parseCommaOrNewlineList(document.getElementById('guardPhrases').value);
         if (groups.length === 0) { setStatus('Please add at least one group with terms.'); return; }
         setLoading(true);
         setStatus('Applying highlight rule…');
         google.script.run
           .withSuccessHandler(function(msg) { setStatus(msg); setLoading(false); })
           .withFailureHandler(function(err) { setStatus('Error: ' + err.message); setLoading(false); })
-          .applyCrawlV2Filter(groups);
+          .applyCrawlV2Filter(groups, guardPhrases);
       }
 
       function addGroup(data) {
@@ -815,14 +765,25 @@
         card.innerHTML =
           '<div class="group-header">' +
             '<span class="group-label">Group ' + groupCount + '</span>' +
-            '<label class="not-label"><input type="checkbox" class="notCheck" onchange="updateStartButtonState()"> NOT</label>' +
+            '<label class="not-label"><input type="checkbox" class="notCheck" onchange="onNotToggle(this)"> NOT</label>' +
             '<button class="remove-btn" onclick="removeGroup(\'' + id + '\')" title="Remove">&#215;</button>' +
+          '</div>' +
+          '<div class="not-mode-row" style="display:none;margin-bottom:6px;">' +
+            '<label style="font-size:11px;color:#555;">When tripped: </label>' +
+            '<select class="notModeSelect" style="width:auto;display:inline-block;font-size:11px;padding:2px 4px;">' +
+              '<option value="exclude">Exclude (hard veto — FALSE)</option>' +
+              '<option value="review">Flag for review (kept, harvested, never expanded)</option>' +
+            '</select>' +
           '</div>' +
           '<input type="text" class="terms-input" placeholder=\'term A, "exact phrase", term C\' oninput="updateStartButtonState()">';
         container.appendChild(card);
         if (data) {
           card.querySelector('.terms-input').value = data.terms || '';
           card.querySelector('.notCheck').checked  = !!data.not;
+          if (data.not) {
+            card.querySelector('.not-mode-row').style.display = 'block';
+            card.querySelector('.notModeSelect').value = data.notMode || 'exclude';
+          }
         }
         updateStartButtonState();
       }
@@ -846,7 +807,10 @@
         document.querySelectorAll('.group-card').forEach(function(card) {
           var terms = card.querySelector('.terms-input').value.trim();
           var not   = card.querySelector('.notCheck').checked;
-          if (terms) groups.push({ terms: terms, not: not });
+          if (!terms) return;
+          var g = { terms: terms, not: not };
+          if (not) g.notMode = card.querySelector('.notModeSelect').value;
+          groups.push(g);
         });
         return groups;
       }

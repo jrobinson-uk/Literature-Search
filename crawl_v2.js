@@ -169,11 +169,36 @@ function normalizeTitleV2(title) {
     .trim();
 }
 
+// getCrawlV2ExistingKeys reconstructs ID + normalised-title keys from the
+// sheet itself, but DOI isn't stored in any column (the sheet's ID
+// convention is W<mag>/S2:<hash>, never a DOI), so a DOI-based duplicate
+// can't be reconstructed retroactively by re-scanning the sheet the way ID/
+// title can. Instead, DOIs seen so far THIS crawl are accumulated in a
+// script property as candidates are written, across all phases and
+// sessions of the same crawl — catching cross-phase duplicates like
+// "App Planner via both the venue pass and the keyword pass" (v22 §8) even
+// when the two occurrences' titles differ enough that normalised-title
+// dedup wouldn't catch them, as long as both carry the same DOI.
+function loadSeenDois() {
+  try { return new Set(JSON.parse(PropertiesService.getScriptProperties().getProperty('CRAWL2_SEEN_DOIS') || '[]')); }
+  catch (e) { return new Set(); }
+}
+function saveSeenDois(doiSet) {
+  // Cap stored size defensively — PropertiesService has a per-property
+  // limit; a crawl accumulating tens of thousands of distinct DOIs is far
+  // beyond what this project's runs have ever produced, but fail safe
+  // (stop persisting further growth) rather than throw mid-crawl.
+  var arr = Array.from(doiSet);
+  if (arr.length > 20000) return;
+  PropertiesService.getScriptProperties().setProperty('CRAWL2_SEEN_DOIS', JSON.stringify(arr));
+}
+
 function getCrawlV2ExistingKeys(sheet) {
   var lastRow = getCrawlLastDataRow(sheet);
   var ids     = new Set();
   var titles  = new Set();
-  if (lastRow < 3) return { ids: ids, titles: titles };
+  var dois    = loadSeenDois();
+  if (lastRow < 3) return { ids: ids, titles: titles, dois: dois };
   var idVals    = sheet.getRange(3, CRAWL_COL.ID,    lastRow - 2, 1).getValues().flat();
   var titleVals = sheet.getRange(3, CRAWL_COL.TITLE, lastRow - 2, 1).getValues().flat();
   idVals.forEach(function(v) { if (v) ids.add(v); });
@@ -181,34 +206,106 @@ function getCrawlV2ExistingKeys(sheet) {
     var norm = normalizeTitleV2(v);
     if (norm) titles.add(norm);
   });
-  return { ids: ids, titles: titles };
+  return { ids: ids, titles: titles, dois: dois };
+}
+
+// True if this candidate is a duplicate of something already in `existing`
+// (ID, normalised title, or DOI) — checked once per candidate across every
+// phase, so the same three-way dedup applies everywhere consistently.
+function isDuplicateCandidateV2(existing, id, normTitle, doi) {
+  if (existing.ids.has(id)) return true;
+  if (normTitle && existing.titles.has(normTitle)) return true;
+  if (doi && existing.dois.has(doi)) return true;
+  return false;
+}
+
+// Records a kept candidate's keys into `existing` (in-memory, for the rest
+// of this batch) AND persists its DOI (if any) into the cross-session
+// CRAWL2_SEEN_DOIS store, since that's the one key that can't be
+// reconstructed later just by re-scanning the sheet.
+function rememberCandidateV2(existing, id, normTitle, doi) {
+  existing.ids.add(id);
+  if (normTitle) existing.titles.add(normTitle);
+  if (doi) {
+    existing.dois.add(doi);
+    saveSeenDois(existing.dois);
+  }
 }
 
 // ============================================================
-// Score-demotion filter — mirrors jsMatchesFilter's term-matching, but
-// treats NOT-groups as advisory rather than a hard veto. A paper that
-// passes every POSITIVE group is kept even if a NOT-group also matched —
-// flagged via a title marker (same non-invasive convention as the existing
-// fetch-failure / malformed-reference markers) instead of silently dropped.
+// Consolidated tri-state filter (v22 §2/§3)
+//
+// One implementation, called identically from every phase (venue, keyword,
+// backward, forward) AND mirrored by the sheet's own live Filter Match
+// formula below (buildFilterMatchFormulaV2 / buildTermFormulaV2) — the
+// brief's diagnosed root cause for "the filter behaves differently per
+// phase" was more than one implementation computing (or approximating) the
+// same thing; this keeps it to one JS function plus one formula-builder
+// that both encode the exact same rules.
+//
+//   TRUE   — every positive group matched, no NOT group tripped
+//   FALSE  — at least one positive group failed to match (checked first,
+//            regardless of any NOT group — never overridden by a NOT hit)
+//   REVIEW — every positive group matched, AND a NOT group whose notMode
+//            is "review" tripped. If BOTH an "exclude"-mode group and a
+//            "review"-mode group trip, exclude wins (FALSE) — per §2's
+//            explicit rule.
+//
+// REVIEW rows are harvested (written, flagged) but never queued for
+// backward/forward expansion — callers gate on state, not a boolean.
+//
+// guardPhrases (global, not per-group): phrases that suppress an otherwise-
+// matching term when its only occurrence is inside one of them (e.g.
+// "Scratch" inside "from scratch"). Implemented by masking every
+// guardPhrase occurrence out of the text before term-matching runs, both
+// here and in the sheet-formula term-helper columns, so a term whose ONLY
+// occurrence was inside a guarded phrase doesn't match either way, while a
+// separate, real occurrence elsewhere in the same text still does.
 // ============================================================
 
-function termsAnyMatchV2(text, group) {
-  if (!group.terms || !group.terms.trim()) return false;
-  var terms = group.terms.split(",")
+function maskGuardPhrases(text, guardPhrases) {
+  if (!guardPhrases || guardPhrases.length === 0) return text;
+  guardPhrases.forEach(function(phrase) {
+    var p = (phrase || '').trim();
+    if (!p) return;
+    var re = new RegExp('\\b' + escapeRegExpTerm(p.toLowerCase()) + '\\b', 'gi'); // escapeRegExpTerm from crawl.js
+    text = text.replace(re, function(m) { return new Array(m.length + 1).join(' '); });
+  });
+  return text;
+}
+
+function parseGroupTermList(group) {
+  if (!group.terms || !group.terms.trim()) return [];
+  return group.terms.split(",")
     .map(function(t) { return t.trim().replace(/^["']|["']$/g, "").trim().toLowerCase(); })
     .filter(function(t) { return t.length > 0; });
+}
+
+function termsAnyMatchV2(text, group) {
+  var terms = parseGroupTermList(group);
   if (terms.length === 0) return false;
   return terms.some(function(t) {
-    return new RegExp('\\b' + escapeRegExpTerm(t) + '\\b', 'i').test(text); // escapeRegExpTerm from crawl.js
+    return new RegExp('\\b' + escapeRegExpTerm(t) + '\\b', 'i').test(text);
   });
 }
 
-// Returns { isMatch, flagged } — isMatch is true iff every positive group
-// matched (NOT-groups don't affect it); flagged is true when isMatch is
-// true AND a NOT-group also hit, i.e. exactly the class of paper the
-// brief's Group-4-veto evidence showed being lost.
-function jsMatchesFilterV2(text, groups) {
-  text = (text || "").toLowerCase();
+// First matching term in a group, for the Flag Reason note on a REVIEW row
+// — so a reviewer doesn't have to re-derive which term triggered it.
+function firstMatchingTerm(text, group) {
+  var terms = parseGroupTermList(group);
+  for (var i = 0; i < terms.length; i++) {
+    if (new RegExp('\\b' + escapeRegExpTerm(terms[i]) + '\\b', 'i').test(text)) return terms[i];
+  }
+  return null;
+}
+
+// Returns { state, isMatch, expand, flagGroupIndex, flagTerm }.
+//   isMatch — true for TRUE or REVIEW (worth keeping/harvesting)
+//   expand  — true only for TRUE (eligible for backward/forward expansion)
+//   flagGroupIndex/flagTerm — set only for REVIEW, which NOT group + term
+//     triggered it (for the Filter Match cell note)
+function jsMatchesFilterV2(rawText, groups, guardPhrases) {
+  var text = maskGuardPhrases((rawText || "").toLowerCase(), guardPhrases);
   var positive = groups.filter(function(g) { return !g.not; });
   var negative = groups.filter(function(g) { return g.not; });
 
@@ -216,30 +313,75 @@ function jsMatchesFilterV2(text, groups) {
     if (!g.terms || !g.terms.trim()) return true;
     return termsAnyMatchV2(text, g);
   });
-  var notHit = negative.some(function(g) { return termsAnyMatchV2(text, g); });
+  if (!positiveOk) return { state: 'FALSE', isMatch: false, expand: false };
 
-  return { isMatch: positiveOk, flagged: positiveOk && notHit };
+  // Exclude wins over review if both trip (§2's explicit rule).
+  for (var i = 0; i < negative.length; i++) {
+    var g = negative[i];
+    if ((g.notMode || 'exclude') === 'exclude' && termsAnyMatchV2(text, g)) {
+      return { state: 'FALSE', isMatch: false, expand: false };
+    }
+  }
+  for (var j = 0; j < negative.length; j++) {
+    var rg = negative[j];
+    if ((rg.notMode || 'exclude') === 'review' && termsAnyMatchV2(text, rg)) {
+      return {
+        state: 'REVIEW', isMatch: true, expand: false,
+        flagGroupIndex: groups.indexOf(rg), flagTerm: firstMatchingTerm(text, rg)
+      };
+    }
+  }
+
+  return { state: 'TRUE', isMatch: true, expand: true };
 }
 
 // ============================================================
-// Filter Match column + row highlight
+// Filter Match column (tri-state text) + row highlight
 //
-// Column K stays boolean TRUE/FALSE, same as v1 — TRUE iff every positive
-// group matched, exactly mirroring jsMatchesFilterV2's isMatch (a NOT-group
-// hit does NOT flip K to FALSE, since a NOT-hit is score-demoted, not a
-// veto — the paper still counts as a match and still propagates).
-// buildFilterMatchFormulaV2 mirrors the shared buildFilterMatchFromTermCols'
-// structure and reuses the same per-term helper columns, but ANDs only the
-// positive groups — NOT-group term columns don't feed into K's value at all.
-//
-// The row highlight is where NOT-hits actually show up: green when K=TRUE
-// and no NOT-group matched, orange when K=TRUE and a NOT-group also
-// matched (the score-demoted case). buildNotHitFormulaForRow builds a
-// plain per-row OR(...) expression directly over the NOT-groups' own
-// term-helper cells (not the MAP-internal param names used inside K's
-// formula) so the two CF rules below can reference it independently of K.
+// Column K now holds "TRUE" / "FALSE" / "REVIEW" as literal text (v22 §2),
+// computed by a sheet formula that mirrors jsMatchesFilterV2's rules
+// exactly: positive groups gate first, then exclude-mode NOT groups, then
+// review-mode NOT groups. The per-term helper columns feeding it apply the
+// same guardPhrases masking as the JS side (buildTermFormulaV2), so the
+// live display can't drift from the write-time decision the way two
+// separately-evolving implementations could.
 // ============================================================
 
+// Sheet-formula equivalent of maskGuardPhrases — nests REGEXREPLACE calls,
+// one per guard phrase, each blanking out \b-bounded case-insensitive
+// occurrences before the term match runs. `textExpr` is the raw
+// LOWER(title&" "&abstract) expression to wrap.
+function buildMaskedTextExprV2(textExpr, guardPhrases) {
+  var expr = textExpr;
+  (guardPhrases || []).forEach(function(phrase) {
+    var p = (phrase || '').trim();
+    if (!p) return;
+    var esc = p.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/"/g, '""');
+    expr = 'REGEXREPLACE(' + expr + ',"\\b' + esc + '\\b"," ")';
+  });
+  return expr;
+}
+
+// v2 variant of snowball.js's shared buildTermFormula, adding guardPhrases
+// masking — not edited in place in snowball.js since that function is
+// shared with the unrelated Snowball feature and v1.
+function buildTermFormulaV2(term, titleColNum, abstractColNum, guardPhrases) {
+  const titleLetter = colToLetter(titleColNum); // from snowball.js
+  const absLetter   = colToLetter(abstractColNum);
+  const safeTerm    = term.replace(/"/g, '""');
+  const regexTerm   = term.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/"/g, '""');
+  const maskedExpr  = buildMaskedTextExprV2('LOWER(t&" "&k)', guardPhrases);
+  return '=MAP(A2:A,' + titleLetter + '2:' + titleLetter + ',' + absLetter + '2:' + absLetter + ',LAMBDA(a,t,k,' +
+         'IF(ROW(a)=2,"' + safeTerm + '",' +
+         'IF(a="","",' +
+         'REGEXMATCH(' + maskedExpr + ',"\\b' + regexTerm + '\\b")' +
+         '))))';
+}
+
+// Tri-state Filter Match formula: positive groups gate first (FALSE if any
+// fails), then exclude-mode NOT groups (FALSE if any trips), then
+// review-mode NOT groups (REVIEW if any trips), else TRUE — the exact same
+// rule order as jsMatchesFilterV2.
 function buildFilterMatchFormulaV2(parsedGroups, firstDetailColNum) {
   const totalTerms = parsedGroups.reduce(function(s, g) { return s + g.terms.length; }, 0);
   if (totalTerms === 0) return null;
@@ -267,44 +409,39 @@ function buildFilterMatchFormulaV2(parsedGroups, firstDetailColNum) {
     return gParams.length === 1 ? gParams[0] : ('OR(' + gParams.join(',') + ')');
   }
 
-  // AND across positive groups only — NOT-groups don't participate in K's
-  // value at all (not even wrapped in NOT()), unlike v1's hard-veto formula.
   const positiveIdx = parsedGroups.map(function(g, gi) { return g.not ? null : gi; })
     .filter(function(x) { return x !== null; });
   const positiveExpr = positiveIdx.length === 0
     ? 'TRUE'
     : (positiveIdx.length === 1 ? orExprFor(positiveIdx[0]) : ('AND(' + positiveIdx.map(orExprFor).join(',') + ')'));
 
+  const excludeIdx = parsedGroups.map(function(g, gi) { return (g.not && (g.notMode || 'exclude') === 'exclude') ? gi : null; })
+    .filter(function(x) { return x !== null; });
+  const excludeExpr = excludeIdx.length === 0
+    ? 'FALSE'
+    : (excludeIdx.length === 1 ? orExprFor(excludeIdx[0]) : ('OR(' + excludeIdx.map(orExprFor).join(',') + ')'));
+
+  const reviewIdx = parsedGroups.map(function(g, gi) { return (g.not && g.notMode === 'review') ? gi : null; })
+    .filter(function(x) { return x !== null; });
+  const reviewExpr = reviewIdx.length === 0
+    ? 'FALSE'
+    : (reviewIdx.length === 1 ? orExprFor(reviewIdx[0]) : ('OR(' + reviewIdx.map(orExprFor).join(',') + ')'));
+
+  const stateExpr =
+    'IF(NOT(' + positiveExpr + '),"FALSE",IF(' + excludeExpr + ',"FALSE",IF(' + reviewExpr + ',"REVIEW","TRUE")))';
+
   return '=MAP(A2:A,' + ranges + ',LAMBDA(' + allParams + ',' +
          'IF(ROW(a)=2,"Filter Match",' +
-         'IF(a="","",' + positiveExpr + '))))';
+         'IF(a="","",' + stateExpr + '))))';
 }
 
-// Plain per-row OR(...) expression over the NOT-groups' term-helper cells,
-// for use in a whenFormulaSatisfied CF rule (relative row references, same
-// convention as v1's own row-highlight rule) — not part of K's own formula.
-// Walks parsedGroups in the same column order applyCrawlV2Highlight lays
-// term-helper columns out in, so the column math matches exactly.
-function buildNotHitFormulaForRow(parsedGroups, firstDetailColNum, row) {
-  var colNum = firstDetailColNum;
-  var negativeGroupCells = [];
-  parsedGroups.forEach(function(g) {
-    var cells = g.terms.map(function() { return colToLetter(colNum++) + row; });
-    if (g.not) negativeGroupCells.push(cells);
-  });
-  if (negativeGroupCells.length === 0) return 'FALSE';
-  var groupExprs = negativeGroupCells.map(function(cells) {
-    return cells.length === 1 ? cells[0] : ('OR(' + cells.join(',') + ')');
-  });
-  return groupExprs.length === 1 ? groupExprs[0] : ('OR(' + groupExprs.join(',') + ')');
-}
-
-// v2 variant of crawl.js's applyCrawlHighlight — identical term-helper
-// column writing (reuses buildTermFormula unmodified), but wires the
-// positive-only formula above into the Filter Match column instead of the
-// shared hard-veto one, and replaces v1's single green row rule with a
-// green/orange pair keyed on K plus the NOT-hit formula.
-function applyCrawlV2Highlight(sheet, groups) {
+// Replaces the shared applyCrawlHighlight (v1, archived) — identical term-
+// helper column writing except it uses buildTermFormulaV2 (guardPhrases-
+// aware) instead of the shared buildTermFormula, wires the tri-state
+// formula above into Filter Match, and highlights rows by K's own text
+// value directly (green=TRUE, orange=REVIEW) rather than needing a
+// separate NOT-hit formula the way the pre-tri-state design did.
+function applyCrawlV2Highlight(sheet, groups, guardPhrases) {
   var CRAWL_FIRST_DETAIL = CRAWL_FIRST_DETAIL_COL;
 
   sheet.getRange(2, CRAWL_IN_SHEET_LINKS_COL)
@@ -314,7 +451,8 @@ function applyCrawlV2Highlight(sheet, groups) {
 
   var parsed = groups.map(function(g) {
     return {
-      not:   g.not,
+      not:     g.not,
+      notMode: g.notMode || 'exclude',
       terms: (g.terms || '').split(',')
         .map(function(t) { return t.trim().replace(/^["'"']|["'"']$/g, '').trim(); })
         .filter(function(t) { return t.length > 0; })
@@ -331,11 +469,12 @@ function applyCrawlV2Highlight(sheet, groups) {
   parsed.forEach(function(g, groupIdx) {
     var groupStartCol = colNum;
     var isNot  = g.not;
-    var termBg = isNot ? '#fce8e6' : '#e8f0fe';
+    var isReview = isNot && g.notMode === 'review';
+    var termBg = isReview ? '#fff3cd' : (isNot ? '#fce8e6' : '#e8f0fe');
 
     g.terms.forEach(function(term) {
       sheet.getRange(2, colNum)
-        .setFormula(buildTermFormula(term, CRAWL_COL.TITLE, CRAWL_COL.ABSTRACT)) // from snowball.js
+        .setFormula(buildTermFormulaV2(term, CRAWL_COL.TITLE, CRAWL_COL.ABSTRACT, guardPhrases))
         .setFontWeight('bold')
         .setHorizontalAlignment('center')
         .setVerticalAlignment('bottom')
@@ -347,8 +486,9 @@ function applyCrawlV2Highlight(sheet, groups) {
     });
 
     if (g.terms.length > 0) {
-      var label = (isNot ? 'NOT Group ' : 'Group ') + (groupIdx + 1);
-      var hdrBg = isNot ? '#e53935' : '#1a73e8';
+      var label = isReview ? 'REVIEW Group ' : (isNot ? 'NOT Group ' : 'Group ');
+      label += (groupIdx + 1);
+      var hdrBg = isReview ? '#f9a825' : (isNot ? '#e53935' : '#1a73e8');
       sheet.getRange(1, groupStartCol, 1, g.terms.length)
         .merge()
         .setValue(label)
@@ -377,44 +517,37 @@ function applyCrawlV2Highlight(sheet, groups) {
       .setBackground('#FFFFFF').setFontColor('#FFFFFF')
       .setRanges([termDataRange]).build();
 
-    // Row highlight: green when K=TRUE and no NOT-group also hit; orange
-    // when K=TRUE and a NOT-group did (the score-demoted case) — replaces
-    // v1's single green =$K3=TRUE rule, which doesn't distinguish the two.
-    var notHitFormula = buildNotHitFormulaForRow(parsed, CRAWL_FIRST_DETAIL, 3);
-    var kLetter       = CRAWL_FILTER_MATCH_COL_LETTER; // "K" — from crawl.js
-    var fullRowRange  = sheet.getRange(3, 1, sheet.getMaxRows() - 2, CRAWL_NUM_COLS);
-    var fullMatchRule = SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied('=AND($' + kLetter + '3=TRUE,NOT(' + notHitFormula + '))')
-      .setBackground('#b7e1cd') // same green as v1
+    // Row highlight now reads K's own tri-state text directly — no
+    // separate NOT-hit formula needed, since K itself already distinguishes
+    // TRUE/FALSE/REVIEW.
+    var kLetter      = CRAWL_FILTER_MATCH_COL_LETTER; // "K" — from crawl.js
+    var fullRowRange = sheet.getRange(3, 1, sheet.getMaxRows() - 2, CRAWL_NUM_COLS);
+    var trueRowRule = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=$' + kLetter + '3="TRUE"')
+      .setBackground('#b7e1cd') // green
       .setRanges([fullRowRange]).build();
-    var partialMatchRule = SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied('=AND($' + kLetter + '3=TRUE,' + notHitFormula + ')')
-      .setBackground('#ffe0b2') // orange — NOT-group hit, still a match, still expands
+    var reviewRowRule = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=$' + kLetter + '3="REVIEW"')
+      .setBackground('#ffe0b2') // orange
       .setRanges([fullRowRange]).build();
 
     // Drop anything touching the term-helper columns (stale per-term rules
-    // from a previous Apply Highlight Rule click), v1's old single green
-    // row rule (=$K3=TRUE, with no NOT-hit distinction), AND any full/
-    // partial row rule from a PREVIOUS Apply Highlight Rule click — those
-    // embed the NOT-hit sub-formula, which changes whenever filter groups
-    // change, so they can't be matched by exact string; a stable prefix
-    // (=AND($K3=TRUE...) is enough to catch either variant regardless of
-    // its embedded NOT-hit expression. Keep everything else (notably the
-    // no-abstract yellow-tint rule).
-    var oldGreenRowFormula   = '=$' + kLetter + '3=TRUE';
-    var rowRulePrefix        = '=AND($' + kLetter + '3=TRUE';
+    // from a previous Apply Highlight Rule click) or any prior row-
+    // highlight rule keyed on K (both the old boolean =$K3=TRUE form and
+    // the old score-demotion =AND($K3=TRUE,...) form, if this sheet was
+    // created before the tri-state change) — keep everything else
+    // (notably the no-abstract yellow-tint rule).
     var existingRules = sheet.getConditionalFormatRules().filter(function(rule) {
       if (rule.getRanges().some(function(r) { return r.getColumn() >= CRAWL_FIRST_DETAIL; })) return false;
       var bc = rule.getBooleanCondition();
       if (bc) {
         var vals    = bc.getCriteriaValues();
         var formula = vals && vals[0];
-        if (formula === oldGreenRowFormula) return false;
-        if (formula && formula.indexOf(rowRulePrefix) === 0) return false;
+        if (formula && formula.indexOf('$' + kLetter + '3') !== -1) return false;
       }
       return true;
     });
-    sheet.setConditionalFormatRules(existingRules.concat([trueRule, falseRule, fullMatchRule, partialMatchRule]));
+    sheet.setConditionalFormatRules(existingRules.concat([trueRule, falseRule, trueRowRule, reviewRowRule]));
   }
 
   var filterFormula = buildFilterMatchFormulaV2(parsed, CRAWL_FIRST_DETAIL);
@@ -426,24 +559,23 @@ function applyCrawlV2Highlight(sheet, groups) {
     .setFontColor('white');
 }
 
-// ============================================================
-// Score-demotion note — the NOT-group-override signal used to live as a
-// Title-prefix marker, but that alters the Title text itself (unlike every
-// other v2 signal, which is out-of-band: the row's orange/green highlight,
-// or a cell note). Moved to a note on the Filter Match cell instead — same
-// non-invasive convention as the existing abstract-source notes, and the
-// most discoverable spot since it explains exactly why that cell is
-// orange. Rows are written via crawlRowFromS2 directly (from crawl.js) —
-// no v2-specific row-building wrapper needed now that nothing mutates
-// the row itself.
-function applyNotGroupNotes(sheet, startRow, flags) {
+// Attaches a Flag Reason note to the Filter Match cell for a REVIEW row —
+// names the specific NOT group and term that triggered it, per §2 ("without
+// it the reviewer has to re-derive the decision"). A cell note rather than
+// a new "Flag Reason" column, consistent with this project's established
+// rule against inserting columns that would shift CRAWL_COL positions for
+// any crawl sheet already in progress.
+function applyFlagReasonNotes(sheet, startRow, flagInfos) {
   if (!startRow) return;
-  for (var i = 0; i < flags.length; i++) {
-    if (!flags[i]) continue;
+  for (var i = 0; i < flagInfos.length; i++) {
+    var info = flagInfos[i];
+    if (!info) continue;
+    var groupLabel = 'NOT group ' + (info.flagGroupIndex + 1);
+    var termLabel  = info.flagTerm ? (' (term: "' + info.flagTerm + '")') : '';
     sheet.getRange(startRow + i, CRAWL_COL.FILTER_MATCH).setNote(
-      'Matches every positive filter group, but also matched a NOT-group — ' +
-      'kept and expanded (score-demoted) rather than excluded. Highlighted ' +
-      'orange for the same reason.'
+      'Flagged for review: matches every positive filter group, but also ' +
+      'tripped ' + groupLabel + termLabel + '. Kept and harvested, but not ' +
+      'expanded — REVIEW rows are terminal nodes pending human triage.'
     );
   }
 }
@@ -528,7 +660,7 @@ function idToExternalIdsV2(id) {
 // token — empty string means "start this batch's first page").
 // ============================================================
 
-function runVenueSweep(sheet, groups, venues, yearFrom, yearTo, maxPapers) {
+function runVenueSweep(sheet, groups, guardPhrases, venues, yearFrom, yearTo, maxPapers) {
   var props = PropertiesService.getScriptProperties();
   var batchIdx  = parseInt(props.getProperty('CRAWL2_VENUE_BATCH_IDX') || '0');
   var token     = props.getProperty('CRAWL2_VENUE_TOKEN') || '';
@@ -561,14 +693,14 @@ function runVenueSweep(sheet, groups, venues, yearFrom, yearTo, maxPapers) {
 
     var newRows  = [];
     var newNotes = [];
-    var newFlags = []; // aligned with newRows — true for a score-demoted NOT-group hit
+    var newFlags = []; // aligned with newRows — flag info {flagGroupIndex, flagTerm} or null
     result.data.forEach(function(paper) {
       if (!paper || !paper.paperId) return;
       var mag = paper.externalIds && paper.externalIds.MAG;
       var id  = mag ? ('W' + mag) : ('S2:' + paper.paperId);
-      if (existing.ids.has(id)) return;
+      var doi = paper.externalIds && paper.externalIds.DOI;
       var normTitle = normalizeTitleV2(paper.title);
-      if (normTitle && existing.titles.has(normTitle)) return;
+      if (isDuplicateCandidateV2(existing, id, normTitle, doi)) return;
 
       var abstract = paper.abstract || '';
       var note = null;
@@ -581,14 +713,15 @@ function runVenueSweep(sheet, groups, venues, yearFrom, yearTo, maxPapers) {
       // Exhaustive by design (§3: "pass it through the existing filter") —
       // no target cap, and no separate year gate here since the venue+year
       // window is already applied server-side via the bulk-search call.
-      var verdict = jsMatchesFilterV2((paper.title || '') + ' ' + abstract, groups);
-      if (!verdict.isMatch) return;
+      var verdict = jsMatchesFilterV2((paper.title || '') + ' ' + abstract, groups, guardPhrases);
+      if (!verdict.isMatch) return; // FALSE — skip. REVIEW and TRUE both kept.
 
-      existing.ids.add(id);
-      if (normTitle) existing.titles.add(normTitle);
-      newRows.push(crawlRowFromS2(paper, 0, '', 'V')); // from crawl.js — Direction='V'
+      rememberCandidateV2(existing, id, normTitle, doi);
+      var row = crawlRowFromS2(paper, 0, '', 'V'); // from crawl.js — Direction='V'
+      if (!verdict.expand) row[CRAWL_COL.CRAWLED - 1] = true; // REVIEW: harvested, never expanded
+      newRows.push(row);
       newNotes.push(note);
-      newFlags.push(verdict.flagged);
+      newFlags.push(verdict.state === 'REVIEW' ? { flagGroupIndex: verdict.flagGroupIndex, flagTerm: verdict.flagTerm } : null);
       collected++;
     });
 
@@ -597,7 +730,7 @@ function runVenueSweep(sheet, groups, venues, yearFrom, yearTo, maxPapers) {
       var canAdd        = Math.max(0, maxPapers - currentCount);
       var writeStart     = writeCrawlRows(sheet, newRows.slice(0, canAdd));
       applyAbstractNotes(sheet, writeStart, newNotes.slice(0, canAdd));
-      applyNotGroupNotes(sheet, writeStart, newFlags.slice(0, canAdd));
+      applyFlagReasonNotes(sheet, writeStart, newFlags.slice(0, canAdd));
       if (canAdd < newRows.length) {
         props.setProperty('CRAWL2_VENUE_BATCH_IDX', String(batchIdx));
         props.setProperty('CRAWL2_VENUE_TOKEN', token);
@@ -773,12 +906,17 @@ function buildKeywordQueries(groups, maxQueries) {
 //                        shortfall passed silently in v19"); the trigger
 //                        stops rather than cascading into backward/forward
 //                        with a thin seed set.
-function runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCeiling, yearBound, opts) {
+function runKeywordPass(sheet, groups, guardPhrases, targetSeeds, maxPapers, yearFloor, yearCeiling, yearBound, opts) {
   opts = opts || {};
-  var paginated  = !!opts.paginated;
+  // v22 §4/§0.1: pagination, the date-sorted sweep, and no year floor are
+  // now the default behaviour of Phase 1 (not opt-in flags) — each still
+  // defaults true even if the caller passes no opts at all. Only pass
+  // `false` explicitly to turn one off (kept for flexibility/testing, not
+  // exposed as a toggle in the panel any more).
+  var paginated  = opts.paginated !== false;
   var pagesPerQuery = parseInt(opts.pagesPerQuery) || PHASE1_PAGES_PER_QUERY_DEFAULT;
-  var dateSweep  = !!opts.dateSweep && paginated;
-  var noYearFloor = !!opts.noYearFloor;
+  var dateSweep  = opts.dateSweep !== false && paginated;
+  var noYearFloor = opts.noYearFloor !== false;
   var maxQueries = parseInt(opts.maxQueries) || (paginated ? KEYWORD_MAX_QUERIES_PAGINATED : KEYWORD_MAX_QUERIES);
   var shortfallTolerance = (opts.shortfallTolerance != null && opts.shortfallTolerance !== '')
     ? parseFloat(opts.shortfallTolerance) : PHASE1_SHORTFALL_TOLERANCE_DEFAULT;
@@ -850,14 +988,14 @@ function runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCe
 
     var newRows  = [];
     var newNotes = [];
-    var newFlags = []; // aligned with newRows — true for a score-demoted NOT-group hit
+    var newFlags = []; // aligned with newRows — flag info {flagGroupIndex, flagTerm} or null
     results.forEach(function(paper) {
       if (!paper || !paper.paperId || collected >= targetSeeds) return;
       var mag = paper.externalIds && paper.externalIds.MAG;
       var id  = mag ? ('W' + mag) : ('S2:' + paper.paperId);
-      if (existing.ids.has(id)) return;
+      var doi = paper.externalIds && paper.externalIds.DOI;
       var normTitle = normalizeTitleV2(paper.title);
-      if (normTitle && existing.titles.has(normTitle)) return;
+      if (isDuplicateCandidateV2(existing, id, normTitle, doi)) return;
 
       var abstract = paper.abstract || '';
       var note = null;
@@ -868,17 +1006,18 @@ function runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCe
       }
 
       var yearOk  = effectiveYearBound ? isYearInBounds(paper.year, yearFloor, yearCeiling, effectiveYearBound) : true; // from crawl.js
-      var verdict = jsMatchesFilterV2((paper.title || '') + ' ' + abstract, groups);
+      var verdict = jsMatchesFilterV2((paper.title || '') + ' ' + abstract, groups, guardPhrases);
       // The keyword pass only ever keeps genuine seeds — there's no "queue"
       // to record a dead-end non-match against the way forward/backward do,
       // since a rejected search result was never a candidate row to begin with.
-      if (!verdict.isMatch || !yearOk) return;
+      if (!verdict.isMatch || !yearOk) return; // FALSE, or year-rejected — skip. REVIEW and TRUE both kept.
 
-      existing.ids.add(id);
-      if (normTitle) existing.titles.add(normTitle);
-      newRows.push(crawlRowFromS2(paper, 0, '', 'K')); // from crawl.js
+      rememberCandidateV2(existing, id, normTitle, doi);
+      var row = crawlRowFromS2(paper, 0, '', 'K'); // from crawl.js
+      if (!verdict.expand) row[CRAWL_COL.CRAWLED - 1] = true; // REVIEW: harvested, never expanded
+      newRows.push(row);
       newNotes.push(note);
-      newFlags.push(verdict.flagged);
+      newFlags.push(verdict.state === 'REVIEW' ? { flagGroupIndex: verdict.flagGroupIndex, flagTerm: verdict.flagTerm } : null);
       collected++;
     });
 
@@ -887,7 +1026,7 @@ function runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCe
       var canAdd        = Math.max(0, maxPapers - currentCount);
       var writeStart     = writeCrawlRows(sheet, newRows.slice(0, canAdd));
       applyAbstractNotes(sheet, writeStart, newNotes.slice(0, canAdd));
-      applyNotGroupNotes(sheet, writeStart, newFlags.slice(0, canAdd));
+      applyFlagReasonNotes(sheet, writeStart, newFlags.slice(0, canAdd));
     }
   }
 
@@ -943,7 +1082,7 @@ function runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCe
 // propPrefix namespaces this pass's own resumability + instrumentation
 // properties — 'CRAWL2_BACKWARD' for pass 1 (unchanged), 'CRAWL2_BACKWARD2'
 // for the optional second pass.
-function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, propPrefix) {
+function runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, propPrefix) {
   propPrefix = propPrefix || 'CRAWL2_BACKWARD';
   var startTime = Date.now();
   var props     = PropertiesService.getScriptProperties();
@@ -971,8 +1110,8 @@ function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCe
     if (depth >= maxDepth) return; // harvest-not-expand — same gate as forward
     var title    = String(row[CRAWL_COL.TITLE - 1]    || '');
     var abstract = String(row[CRAWL_COL.ABSTRACT - 1] || '');
-    var verdict  = jsMatchesFilterV2(title + ' ' + abstract, groups);
-    if (!verdict.isMatch) return; // only Filter Match=TRUE papers expand backward
+    var verdict  = jsMatchesFilterV2(title + ' ' + abstract, groups, guardPhrases);
+    if (!verdict.expand) return; // only Filter Match=TRUE papers expand backward — REVIEW rows are terminal
     paperIds.push(id);
     paperSheetRows.push(3 + i);
     paperDepths.push(depth);
@@ -1008,14 +1147,14 @@ function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCe
 
     var newRows  = [];
     var newNotes = [];
-    var newFlags = []; // aligned with newRows — true for a score-demoted NOT-group hit
+    var newFlags = []; // aligned with newRows — flag info {flagGroupIndex, flagTerm} or null
     refs.forEach(function(ref) {
       if (!ref || !ref.paperId) return;
       var mag   = ref.externalIds && ref.externalIds.MAG;
       var refId = mag ? ('W' + mag) : ('S2:' + ref.paperId);
-      if (existing.ids.has(refId)) return;
+      var doi   = ref.externalIds && ref.externalIds.DOI;
       var normTitle = normalizeTitleV2(ref.title);
-      if (normTitle && existing.titles.has(normTitle)) return;
+      if (isDuplicateCandidateV2(existing, refId, normTitle, doi)) return;
 
       var note = null;
       if (!ref.abstract) {
@@ -1025,14 +1164,15 @@ function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCe
       }
 
       var yearOk  = isYearInBounds(ref.year, yearFloor, yearCeiling, yearBound);
-      var verdict = jsMatchesFilterV2((ref.title || '') + ' ' + (ref.abstract || ''), groups);
-      if (!verdict.isMatch || !yearOk) return;
+      var verdict = jsMatchesFilterV2((ref.title || '') + ' ' + (ref.abstract || ''), groups, guardPhrases);
+      if (!verdict.isMatch || !yearOk) return; // FALSE, or year-rejected — skip. REVIEW and TRUE both kept.
 
-      existing.ids.add(refId);
-      if (normTitle) existing.titles.add(normTitle);
-      newRows.push(crawlRowFromS2(ref, paperDepth + 1, paperId, 'B')); // from crawl.js
+      rememberCandidateV2(existing, refId, normTitle, doi);
+      var row = crawlRowFromS2(ref, paperDepth + 1, paperId, 'B'); // from crawl.js
+      if (!verdict.expand) row[CRAWL_COL.CRAWLED - 1] = true; // REVIEW: harvested, never expanded
+      newRows.push(row);
       newNotes.push(note);
-      newFlags.push(verdict.flagged);
+      newFlags.push(verdict.state === 'REVIEW' ? { flagGroupIndex: verdict.flagGroupIndex, flagTerm: verdict.flagTerm } : null);
       kept++;
     });
 
@@ -1041,7 +1181,7 @@ function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCe
       var canAdd        = Math.max(0, maxPapers - currentCount);
       var writeStart     = writeCrawlRows(sheet, newRows.slice(0, canAdd));
       applyAbstractNotes(sheet, writeStart, newNotes.slice(0, canAdd));
-      applyNotGroupNotes(sheet, writeStart, newFlags.slice(0, canAdd));
+      applyFlagReasonNotes(sheet, writeStart, newFlags.slice(0, canAdd));
     }
   }
 
@@ -1063,7 +1203,7 @@ function runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCe
 // fallback pattern (with the longer v2 backoff).
 // ============================================================
 
-function runForwardPassV2(sheet, groups, maxDepth, maxPapers, matchesOnly, yearFloor, yearCeiling, yearBound) {
+function runForwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, matchesOnly, yearFloor, yearCeiling, yearBound) {
   matchesOnly = matchesOnly !== false;
   var startTime = Date.now();
   var processed  = 0;
@@ -1114,14 +1254,14 @@ function runForwardPassV2(sheet, groups, maxDepth, maxPapers, matchesOnly, yearF
     var existing      = getCrawlV2ExistingKeys(sheet);
     var matchRows     = [];
     var abstractNotes = [];
-    var notGroupFlags = []; // aligned with matchRows — true for a score-demoted NOT-group hit
+    var flagInfos     = []; // aligned with matchRows — flag info {flagGroupIndex, flagTerm} or null
     for (var i = 0; i < candidates.length; i++) {
       var c   = candidates[i];
       var mag = c.externalIds && c.externalIds.MAG;
       var cId = mag ? ('W' + mag) : ('S2:' + c.paperId);
-      if (existing.ids.has(cId)) continue;
+      var cDoi = c.externalIds && c.externalIds.DOI;
       var normTitle = normalizeTitleV2(c.title);
-      if (normTitle && existing.titles.has(normTitle)) continue;
+      if (isDuplicateCandidateV2(existing, cId, normTitle, cDoi)) continue;
 
       var abstract = c.abstract || '';
       var note = null;
@@ -1132,19 +1272,19 @@ function runForwardPassV2(sheet, groups, maxDepth, maxPapers, matchesOnly, yearF
       }
 
       var yearOk  = isYearInBounds(getCandidateYear(c, "forward"), yearFloor, yearCeiling, yearBound); // from crawl.js
-      var verdict = jsMatchesFilterV2((c.title || '') + ' ' + abstract, groups);
-      var isMatch = verdict.isMatch && yearOk;
-      if (!isMatch && matchesOnly) continue;
+      var verdict = jsMatchesFilterV2((c.title || '') + ' ' + abstract, groups, guardPhrases);
+      var keep    = verdict.isMatch && yearOk;   // TRUE or REVIEW, and within the year bound
+      var expand  = verdict.expand  && yearOk;   // TRUE only — REVIEW is always terminal
+      if (!keep && matchesOnly) continue;
       var row = crawlRowFromS2(c, depth + 1, id, 'F'); // from crawl.js
-      if (!isMatch) row[CRAWL_COL.CRAWLED - 1] = true;
+      if (!expand) row[CRAWL_COL.CRAWLED - 1] = true;
       matchRows.push(row);
       abstractNotes.push(note);
-      // Only a genuine match can carry the score-demotion note — if yearOk
-      // is what actually rejected it, "NOT-group override" would be a
+      // Only a genuine REVIEW verdict carries the flag note — if yearOk is
+      // what actually excluded it, a "flagged for review" note would be a
       // misleading explanation for why the row is there.
-      notGroupFlags.push(isMatch && verdict.flagged);
-      existing.ids.add(cId);
-      if (normTitle) existing.titles.add(normTitle);
+      flagInfos.push((keep && verdict.state === 'REVIEW') ? { flagGroupIndex: verdict.flagGroupIndex, flagTerm: verdict.flagTerm } : null);
+      rememberCandidateV2(existing, cId, normTitle, cDoi);
     }
 
     if (matchRows.length > 0) {
@@ -1152,7 +1292,7 @@ function runForwardPassV2(sheet, groups, maxDepth, maxPapers, matchesOnly, yearF
       var canAdd        = Math.max(0, maxPapers - currentCount);
       var writeStart     = writeCrawlRows(sheet, matchRows.slice(0, canAdd));
       applyAbstractNotes(sheet, writeStart, abstractNotes.slice(0, canAdd));
-      applyNotGroupNotes(sheet, writeStart, notGroupFlags.slice(0, canAdd));
+      applyFlagReasonNotes(sheet, writeStart, flagInfos.slice(0, canAdd));
       if (canAdd < matchRows.length) {
         sheet.getRange(sheetRow, CRAWL_COL.CRAWLED).setValue(true);
         processed++;
@@ -1219,10 +1359,13 @@ function runAbstractRetrySweep(sheet, startIdx) {
 
 // ============================================================
 // Background batch handler — the v2 trigger entry point.
-// Phase order (v3): venue (if enabled) → keyword → backward (if enabled)
-// → forward → backward2 (if enabled) → sweep → complete. Every new phase
-// is opt-in and off by default — a run with all v3 options left off
-// reproduces the v19 order exactly (keyword → backward → forward → sweep).
+// Phase order (v22 §0.1/§1: promoted to default, no longer gated by
+// on/off flags): venue → keyword → backward → forward → backward2 (second
+// backward pass, over the now-larger match set forward produced) → sweep
+// → complete. Venue is a no-op if no venues are configured; every other
+// phase always runs. matchesOnly/yearBound/maxDepth/maxPapers/backward
+// depth remain per-run configuration, just no longer an on/off switch for
+// whole phases.
 // ============================================================
 
 function crawlV2BatchTrigger() {
@@ -1237,39 +1380,36 @@ function crawlV2BatchTrigger() {
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
     if (!sheet) { deleteCrawlV2Trigger(); return; }
 
-    var phase       = props.getProperty('CRAWL2_PHASE') || 'keyword';
+    var phase       = props.getProperty('CRAWL2_PHASE') || 'venue';
     var batch       = parseInt(props.getProperty('CRAWL2_BATCH_NUM') || '1');
     var groups      = JSON.parse(props.getProperty('CRAWL2_FILTER_GROUPS') || '[]');
-    var maxDepth    = parseInt(props.getProperty('CRAWL2_MAX_DEPTH')  || '3');
+    var guardPhrases = JSON.parse(props.getProperty('CRAWL2_GUARD_PHRASES') || '[]');
+    var maxDepth    = parseInt(props.getProperty('CRAWL2_MAX_DEPTH')  || '2');
     var maxPapers   = parseInt(props.getProperty('CRAWL2_MAX_PAPERS') || '300');
     var matchesOnly = props.getProperty('CRAWL2_MATCHES_ONLY') !== 'false';
-    var runBackward = props.getProperty('CRAWL2_RUN_BACKWARD') !== 'false';
     var yearFloor   = parseInt(props.getProperty('CRAWL2_YEAR_FLOOR')   || '0') || 0;
     var yearCeiling = parseInt(props.getProperty('CRAWL2_YEAR_CEILING') || '0') || 0;
     var yearBound   = props.getProperty('CRAWL2_YEAR_BOUND') !== 'false';
     var targetSeeds = parseInt(props.getProperty('CRAWL2_TARGET_SEEDS') || String(KEYWORD_SEARCH_TARGET_DEFAULT));
     var logRow      = parseInt(props.getProperty('CRAWL2_LOG_ROW') || '0') || 0;
 
-    // v3 opt-in options — all default off/unset, reproducing v19 exactly.
-    var phase0Enabled  = props.getProperty('CRAWL2_PHASE0_ENABLED') === 'true';
     var phase0Venues   = JSON.parse(props.getProperty('CRAWL2_PHASE0_VENUES') || '[]');
     var phase0YearFrom = parseInt(props.getProperty('CRAWL2_PHASE0_YEAR_FROM') || String(PHASE0_YEAR_FROM_DEFAULT));
     var phase0YearTo   = parseInt(props.getProperty('CRAWL2_PHASE0_YEAR_TO')   || String(PHASE0_YEAR_TO_DEFAULT));
-    var phase2Second   = props.getProperty('CRAWL2_PHASE2_SECOND_PASS') === 'true';
     var keywordOpts = {
-      paginated:          props.getProperty('CRAWL2_PHASE1_PAGINATED') === 'true',
       pagesPerQuery:      parseInt(props.getProperty('CRAWL2_PHASE1_PAGES_PER_QUERY') || String(PHASE1_PAGES_PER_QUERY_DEFAULT)),
-      dateSweep:          props.getProperty('CRAWL2_PHASE1_DATE_SWEEP') === 'true',
-      noYearFloor:        props.getProperty('CRAWL2_PHASE1_NO_YEAR_FLOOR') === 'true',
       maxQueries:         parseInt(props.getProperty('CRAWL2_PHASE1_MAX_QUERIES') || '0') || 0,
       shortfallTolerance: parseFloat(props.getProperty('CRAWL2_PHASE1_SHORTFALL_TOLERANCE') || String(PHASE1_SHORTFALL_TOLERANCE_DEFAULT))
+      // paginated/dateSweep/noYearFloor deliberately omitted — runKeywordPass
+      // defaults all three to true now that they're the standard behaviour,
+      // not opt-in flags.
     };
 
     var result;
 
     if (phase === 'venue') {
       setCrawlStatus(sheet, 'Venue sweep — batch ' + batch + '…');
-      result = runVenueSweep(sheet, groups, phase0Venues, phase0YearFrom, phase0YearTo, maxPapers);
+      result = runVenueSweep(sheet, groups, guardPhrases, phase0Venues, phase0YearFrom, phase0YearTo, maxPapers);
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
@@ -1284,26 +1424,26 @@ function crawlV2BatchTrigger() {
 
     } else if (phase === 'keyword') {
       setCrawlStatus(sheet, 'Keyword pass — batch ' + batch + '…');
-      result = runKeywordPass(sheet, groups, targetSeeds, maxPapers, yearFloor, yearCeiling, yearBound, keywordOpts);
+      result = runKeywordPass(sheet, groups, guardPhrases, targetSeeds, maxPapers, yearFloor, yearCeiling, yearBound, keywordOpts);
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
       } else if (result.status === 'shortfall') {
-        // Required instrumentation (v3 §4): stop rather than cascade into
+        // Required instrumentation (§4): stop rather than cascade into
         // backward/forward with a thin seed set — resumable, same
         // "Resume v2 Crawl continues anyway" convention as Paper Limit.
         deleteCrawlV2Trigger();
         updateLogRow(logRow, 'Shortfall');
         setCrawlStatus(sheet, result.message);
       } else {
-        props.setProperty('CRAWL2_PHASE', runBackward ? 'backward' : 'forward');
+        props.setProperty('CRAWL2_PHASE', 'backward');
         props.setProperty('CRAWL2_BATCH_NUM', '1');
-        setCrawlStatus(sheet, result.message + ' — starting ' + (runBackward ? 'backward' : 'forward') + ' pass…');
+        setCrawlStatus(sheet, result.message + ' — starting backward pass…');
       }
 
     } else if (phase === 'backward') {
       setCrawlStatus(sheet, 'Backward pass — batch ' + batch + '…');
-      result = runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD');
+      result = runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD');
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
@@ -1315,25 +1455,22 @@ function crawlV2BatchTrigger() {
 
     } else if (phase === 'forward') {
       setCrawlStatus(sheet, 'Forward pass — batch ' + batch + '…');
-      result = runForwardPassV2(sheet, groups, maxDepth, maxPapers, matchesOnly, yearFloor, yearCeiling, yearBound);
+      result = runForwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, matchesOnly, yearFloor, yearCeiling, yearBound);
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
       } else if (result.status === 'paper-limit') {
         deleteCrawlV2Trigger();
         setCrawlStatus(sheet, result.message);
-      } else if (phase2Second) {
+      } else {
         props.setProperty('CRAWL2_PHASE', 'backward2');
         props.setProperty('CRAWL2_BATCH_NUM', '1');
-        setCrawlStatus(sheet, result.message + ' — starting second backward pass (v3, over the now-larger match set)…');
-      } else {
-        props.setProperty('CRAWL2_PHASE', 'sweep');
-        setCrawlStatus(sheet, result.message + ' — running final abstract retry sweep…');
+        setCrawlStatus(sheet, result.message + ' — starting second backward pass (over the now-larger match set)…');
       }
 
     } else if (phase === 'backward2') {
       setCrawlStatus(sheet, 'Second backward pass — batch ' + batch + '…');
-      result = runBackwardPassV2(sheet, groups, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD2');
+      result = runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD2');
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
@@ -1394,24 +1531,22 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
     var opts        = options || {};
     var matchesOnly = opts.matchesOnly !== false;
     var yearBound   = opts.yearBound   !== false;
-    // Default ON — backward is core to the v2 pipeline (Phase 2), but still
-    // toggleable off for a keyword+forward-only comparison run.
-    var runBackward = opts.runBackward !== false;
 
-    // v3 additions — all default off/unset, so a plain call reproduces
-    // today's (v19) pipeline exactly (§0.2 of the v3 brief).
-    var phase0Enabled  = !!opts.phase0Enabled;
+    // v22 §0.1/§1: venue sweep, the backward dual-pass, and Phase 1's
+    // pagination/date-sweep/no-floor are now the standard pipeline, not
+    // opt-in flags — no on/off toggles for any of these any more. Their
+    // own tunable parameters (venue list, year window, pages/query, max
+    // queries, shortfall tolerance) remain configurable.
     var phase0Venues   = Array.isArray(opts.phase0Venues) ? opts.phase0Venues : [];
     var phase0YearFrom = parseInt(opts.phase0YearFrom) || PHASE0_YEAR_FROM_DEFAULT;
     var phase0YearTo   = parseInt(opts.phase0YearTo)   || PHASE0_YEAR_TO_DEFAULT;
-    var phase1Paginated          = !!opts.phase1Paginated;
     var phase1PagesPerQuery      = parseInt(opts.phase1PagesPerQuery) || PHASE1_PAGES_PER_QUERY_DEFAULT;
-    var phase1DateSweep          = !!opts.phase1DateSweep;
-    var phase1NoYearFloor        = !!opts.phase1NoYearFloor;
     var phase1MaxQueries         = parseInt(opts.phase1MaxQueries) || 0; // 0 = let runKeywordPass pick its own default
     var phase1ShortfallTolerance = (opts.phase1ShortfallTolerance != null && opts.phase1ShortfallTolerance !== '')
       ? parseFloat(opts.phase1ShortfallTolerance) : PHASE1_SHORTFALL_TOLERANCE_DEFAULT;
-    var phase2SecondPass = !!opts.phase2SecondPass;
+    // Global term-match suppression list (v22 §6 — e.g. "from scratch"
+    // shouldn't count as a "Scratch" hit) — not per filter group.
+    var guardPhrases = Array.isArray(opts.guardPhrases) ? opts.guardPhrases : [];
 
     seeds = seeds || [];
 
@@ -1436,15 +1571,16 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
 
     var props = PropertiesService.getScriptProperties();
     props.setProperty('CRAWL2_ACTIVE_SHEET',    sheetName);
-    props.setProperty('CRAWL2_MAX_DEPTH',       String(maxDepth  || 3));
+    props.setProperty('CRAWL2_MAX_DEPTH',       String(maxDepth  || 2)); // depth 2 default (v22 §11.5 — was 3)
     props.setProperty('CRAWL2_MAX_PAPERS',      String(maxPapers || 300));
     props.setProperty('CRAWL2_TARGET_SEEDS',    String(targetN));
     props.setProperty('CRAWL2_FILTER_GROUPS',   JSON.stringify(groups)); // v2's OWN key — not shared with v1/Snowball
-    // Phase 0 is a genuinely new entry point ahead of keyword when enabled;
-    // otherwise the pipeline starts exactly where v19 did.
-    props.setProperty('CRAWL2_PHASE',           phase0Enabled ? 'venue' : 'keyword');
+    props.setProperty('CRAWL2_GUARD_PHRASES',   JSON.stringify(guardPhrases));
+    // Fixed phase sequence now (venue -> keyword -> backward -> forward ->
+    // backward2 -> sweep) — venue always starts first; it's a harmless
+    // no-op if no venues are configured.
+    props.setProperty('CRAWL2_PHASE',           'venue');
     props.setProperty('CRAWL2_MATCHES_ONLY',    matchesOnly ? 'true' : 'false');
-    props.setProperty('CRAWL2_RUN_BACKWARD',    runBackward ? 'true' : 'false');
     props.setProperty('CRAWL2_YEAR_BOUND',      yearBound   ? 'true' : 'false');
     props.setProperty('CRAWL2_YEAR_FLOOR',      String(yearFloor));
     props.setProperty('CRAWL2_YEAR_CEILING',    String(yearCeiling));
@@ -1462,22 +1598,17 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
     props.setProperty('CRAWL2_SWEEP_IDX',         '0');
     props.setProperty('CRAWL2_SWEEP_RECOVERED',   '0');
     props.setProperty('CRAWL2_BATCH_NUM',         '1');
+    props.setProperty('CRAWL2_SEEN_DOIS',         '[]'); // fresh cross-phase DOI dedup store for this crawl
 
-    // v3 option persistence — read fresh by crawlV2BatchTrigger every firing.
-    props.setProperty('CRAWL2_PHASE0_ENABLED',   phase0Enabled ? 'true' : 'false');
     props.setProperty('CRAWL2_PHASE0_VENUES',    JSON.stringify(phase0Venues));
     props.setProperty('CRAWL2_PHASE0_YEAR_FROM', String(phase0YearFrom));
     props.setProperty('CRAWL2_PHASE0_YEAR_TO',   String(phase0YearTo));
     props.setProperty('CRAWL2_VENUE_BATCH_IDX',  '0');
     props.setProperty('CRAWL2_VENUE_TOKEN',      '');
     props.setProperty('CRAWL2_VENUE_COUNT',      '0');
-    props.setProperty('CRAWL2_PHASE1_PAGINATED',            phase1Paginated ? 'true' : 'false');
     props.setProperty('CRAWL2_PHASE1_PAGES_PER_QUERY',      String(phase1PagesPerQuery));
-    props.setProperty('CRAWL2_PHASE1_DATE_SWEEP',           phase1DateSweep ? 'true' : 'false');
-    props.setProperty('CRAWL2_PHASE1_NO_YEAR_FLOOR',        phase1NoYearFloor ? 'true' : 'false');
     props.setProperty('CRAWL2_PHASE1_MAX_QUERIES',          String(phase1MaxQueries));
     props.setProperty('CRAWL2_PHASE1_SHORTFALL_TOLERANCE',  String(phase1ShortfallTolerance));
-    props.setProperty('CRAWL2_PHASE2_SECOND_PASS', phase2SecondPass ? 'true' : 'false');
 
     var logRow = appendLogRow('CrawlV2', {
       name:          sheetName,
@@ -1488,8 +1619,8 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
       depth:         maxDepth,
       maxPapers:     maxPapers,
       filterGroups:  groups,
-      runBackward:   runBackward,
-      expandBackward: false
+      runBackward:   true,   // backward now always runs, both before and after forward
+      expandBackward: true
     });
     if (logRow) props.setProperty('CRAWL2_LOG_ROW', String(logRow));
 
@@ -1506,10 +1637,10 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
     }
 
     ss.setActiveSheet(sheet);
-    applyCrawlV2Highlight(sheet, groups); // boolean K + green/orange row highlight, not v1's plain green rule
+    applyCrawlV2Highlight(sheet, groups, guardPhrases); // tri-state K (TRUE/FALSE/REVIEW) + green/orange row highlight
 
     createCrawlV2Trigger();
-    setCrawlStatus(sheet, phase0Enabled ? 'Running venue sweep batch 1…' : 'Running keyword pass batch 1…');
+    setCrawlStatus(sheet, 'Running venue sweep batch 1…');
 
     return 'Crawl v2 started — running in the background. Watch the "Crawl Status" cell at the top of the sheet. You can close this panel.';
 
@@ -1526,7 +1657,7 @@ function resumeCrawlV2() {
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
     if (!sheet) return 'Crawl sheet "' + sheetName + '" not found — it may have been deleted.';
 
-    var phase = props.getProperty('CRAWL2_PHASE') || 'keyword';
+    var phase = props.getProperty('CRAWL2_PHASE') || 'venue';
     // Only forward/backward/backward2 have a real Crawled=FALSE queue to
     // check for emptiness — venue/keyword/sweep track progress via their
     // own idx properties and are resumable regardless of countUncrawled().
@@ -1546,15 +1677,17 @@ function resumeCrawlV2() {
 }
 
 // Called from the v2 panel's "Apply Highlight Rule" button.
-function applyCrawlV2Filter(groups) {
+function applyCrawlV2Filter(groups, guardPhrases) {
   try {
     var props     = PropertiesService.getScriptProperties();
     var sheetName = props.getProperty('CRAWL2_ACTIVE_SHEET');
     if (!sheetName) return 'No active v2 crawl sheet found.';
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
     if (!sheet) return 'Crawl sheet "' + sheetName + '" not found.';
+    guardPhrases = Array.isArray(guardPhrases) ? guardPhrases : [];
     props.setProperty('CRAWL2_FILTER_GROUPS', JSON.stringify(groups));
-    applyCrawlV2Highlight(sheet, groups); // boolean K + green/orange row highlight, not v1's plain green rule
+    props.setProperty('CRAWL2_GUARD_PHRASES', JSON.stringify(guardPhrases));
+    applyCrawlV2Highlight(sheet, groups, guardPhrases); // tri-state K (TRUE/FALSE/REVIEW) + green/orange row highlight
     return 'Highlight rule updated on "' + sheetName + '".';
   } catch (e) {
     return 'Error: ' + e.message;

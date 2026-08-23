@@ -908,7 +908,11 @@
           return;
         }
         if (!replay.type) { setStatus('Unrecognised resume code format.'); return; }
-        if (replay.type !== 'CrawlV2') {
+        // 'Crawl' = an old v1 resume code, pasted here since v1's own panel
+        // is retired — its config (seeds, filter groups) still loads fine,
+        // just always as a fresh crawl (the original v1 sheet itself can't
+        // be resumed mid-crawl any more).
+        if (replay.type !== 'CrawlV2' && replay.type !== 'Crawl') {
           setStatus('This code is for a ' + replay.type + ' search — open that panel to load it.');
           return;
         }

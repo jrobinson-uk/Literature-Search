@@ -221,24 +221,12 @@ function resumeFromLog() {
   var canResume  = false;
 
   if (type === 'Crawl') {
-    var crawlSheet   = ss.getSheetByName(name);
-    // Errors are stored as "Error: <message>", never the bare string 'Error' —
-    // match on prefix so errored crawls aren't treated as resumable.
-    var isIncomplete = crawlSheet && status !== 'Complete' && status.indexOf('Error') === -1;
-
-    if (isIncomplete) {
-      // Restore all crawl script properties so the Resume button works correctly
-      props.setProperty('CRAWL_ACTIVE_SHEET',    name);
-      props.setProperty('CRAWL_DIRECTION',       'forward');
-      props.setProperty('CRAWL_MAX_DEPTH',       String(depth      || 2));
-      props.setProperty('CRAWL_MAX_PAPERS',      String(maxPapers  || 300));
-      props.setProperty('SNOWBALL_FILTER_GROUPS', JSON.stringify(filterGroups));
-      props.setProperty('CRAWL_RUN_BACKWARD',    backwardPass !== 'None' ? 'true' : 'false');
-      props.setProperty('CRAWL_EXPAND_BACKWARD', backwardPass === 'Backward + Expand' ? 'true' : 'false');
-      // Keep the same log row so status updates continue on the original entry
-      props.setProperty('CRAWL_LOG_ROW',         String(row));
-      canResume = true;
-    }
+    // v1's own orchestration (crawlBatchTrigger, resumeCrawl) was retired in
+    // v22 — an old v1 sheet genuinely can't be resumed mid-crawl any more,
+    // so canResume stays false here rather than restoring CRAWL_* properties
+    // for a trigger function that no longer exists. The seeds/filter groups
+    // below still get carried into the replay, though, so the v2 panel can
+    // pre-fill them for a FRESH crawl reusing the same configuration.
   } else if (type === 'CrawlV2') {
     var crawlV2Sheet   = ss.getSheetByName(name);
     var isIncompleteV2 = crawlV2Sheet && status !== 'Complete' && status.indexOf('Error') === -1;
@@ -261,8 +249,15 @@ function resumeFromLog() {
     }
   }
 
+  // Old v1 'Crawl' rows now open in the v2 panel too (v1's own panel/
+  // orchestration is retired), so the replay's type is presented to that
+  // panel as 'CrawlV2' — the panel's own replay handler only auto-applies
+  // a 'CrawlV2'-typed object. The STORED log-row type is untouched; this
+  // only affects what this one resumeFromLog() call hands the panel.
+  var replayType = (type === 'Crawl') ? 'CrawlV2' : type;
+
   var replay = {
-    type:         type,
+    type:         replayType,
     name:         name,
     seedsStr:     seedsStr,        // pipe-separated IDs → panel converts to comma-sep input
     depth:        depth,
@@ -276,7 +271,7 @@ function resumeFromLog() {
 
   props.setProperty('LOG_REPLAY', JSON.stringify(replay));
 
-  if      (type === 'Crawl')    showCrawlbar();
+  if      (type === 'Crawl')    showCrawlV2bar(); // v1's own panel is retired — opens in the (now sole) crawl panel instead
   else if (type === 'CrawlV2')  showCrawlV2bar();
   else if (type === 'Snowball') showSnowballbar();
   else                          showSidebar();

@@ -1067,6 +1067,12 @@ function runForwardPassV2(sheet, groups, maxDepth, maxPapers, matchesOnly, yearF
   matchesOnly = matchesOnly !== false;
   var startTime = Date.now();
   var processed  = 0;
+  // Rows that failed this session and are being left queued for a later
+  // retry (markFetchFailure returned true) — skipped for the REST of this
+  // pass so the loop doesn't immediately re-select the same failing row
+  // over and over and burn the whole time budget on it; a future session
+  // starts this set fresh and retries normally.
+  var retriedThisPass = new Set();
 
   while (true) {
     if (Date.now() - startTime > CRAWL2_TIME_LIMIT_MS) {
@@ -1076,7 +1082,7 @@ function runForwardPassV2(sheet, groups, maxDepth, maxPapers, matchesOnly, yearF
              " papers this session; " + remaining + " remain in queue. Click Resume Crawl v2 to continue." };
     }
 
-    var next = findNextUncrawled(sheet); // from crawl.js
+    var next = findNextUncrawled(sheet, retriedThisPass); // from crawl.js
     if (!next) {
       updateCrawlMatchedCites(sheet);
       return { status: 'complete', message: "Forward pass complete. " + processed + " papers processed in this session." };
@@ -1097,8 +1103,8 @@ function runForwardPassV2(sheet, groups, maxDepth, maxPapers, matchesOnly, yearF
     try {
       candidates = fetchForwardCandidates(id, title); // from crawl.js
     } catch (e) {
-      markFetchFailure(sheet, sheetRow, e);
-      sheet.getRange(sheetRow, CRAWL_COL.CRAWLED).setValue(true);
+      var shouldRetry = markFetchFailure(sheet, sheetRow, e); // from crawl.js
+      if (shouldRetry) { retriedThisPass.add(sheetRow); } else { sheet.getRange(sheetRow, CRAWL_COL.CRAWLED).setValue(true); }
       processed++;
       continue;
     }

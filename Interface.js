@@ -11,12 +11,10 @@ function onOpen() {
     .addItem('Open Search Panel', 'showSidebar')
     .addSeparator()
     .addItem('Snowball Search', 'showSnowballbar')
-    .addItem('Citation Crawl', 'showCrawlbar')
-    .addItem('Citation Crawl v2 (Beta)', 'showCrawlV2bar')
+    .addItem('Citation Crawl', 'showCrawlV2bar')
     .addSeparator()
     .addItem('Load Selected Log Row', 'resumeFromLog')
-    .addItem('Cancel Crawl', 'cancelCrawl')
-    .addItem('Cancel Crawl v2', 'cancelCrawlV2')
+    .addItem('Cancel Crawl', 'cancelCrawlV2')
     .addSeparator()
     .addItem('Set SerpAPI Key', 'promptForKey')
     .addItem('Set OpenAlex Email', 'promptForOpenAlexEmail')
@@ -49,21 +47,22 @@ function showSnowballbar() {
 // 300px by Sheets itself (setWidth() is silently ignored for showSidebar()),
 // so a genuinely wider panel means a floating dialog instead. Modeless, not
 // modal, so it doesn't block interacting with the sheet while a crawl runs.
-function showCrawlbar() {
-  const html = HtmlService.createHtmlOutputFromFile('crawl_panel')
-    .setWidth(450)
-    .setHeight(700);
-  SpreadsheetApp.getUi().showModelessDialog(html, 'Citation Crawl');
-}
-
-// Parallel v2 pipeline (keyword → backward → forward) — a separate dialog,
-// separate sheet, separate CRAWL2_* script properties and trigger from the
-// v1 Citation Crawl above, so both can run side by side. See crawl_v2.js.
+//
+// As of v22 this is the only citation crawl pipeline (the original v1
+// forward/backward-only crawler has been archived — see crawl.js's header
+// comment and archive/). Internal names (crawl_v2_panel.html, CRAWL2_*
+// script properties, the *V2 function suffixes throughout crawl_v2.js) are
+// kept as-is deliberately, not renamed to drop the "2"/"V2" — there may be
+// stopped-but-resumable old v1 crawls whose script properties use the
+// original unprefixed names, and reusing those exact names here risked
+// colliding with and corrupting that state. Only the user-facing labels
+// (this dialog's title, the menu entry) have been promoted to plain
+// "Citation Crawl".
 function showCrawlV2bar() {
   const html = HtmlService.createHtmlOutputFromFile('crawl_v2_panel')
     .setWidth(450)
     .setHeight(700);
-  SpreadsheetApp.getUi().showModelessDialog(html, 'Citation Crawl v2 (Beta)');
+  SpreadsheetApp.getUi().showModelessDialog(html, 'Citation Crawl');
 }
 
 function promptForKey() {

@@ -2,3 +2,9 @@
 # skipSubdirectories:true in .clasp.json already handles this,
 # but belt-and-braces in case clasp version behaviour changes.
 .claude/
+
+# archive/ holds the original v1 crawler (crawl_v1_full.js,
+# crawl_panel_v1.html) verbatim, for reference/restoration only — never
+# executed. skipSubdirectories already excludes it; listed here too for
+# the same belt-and-braces reason as .claude/ above.
+archive/

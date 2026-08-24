@@ -1432,6 +1432,12 @@ function crawlV2BatchTrigger() {
         // Required instrumentation (§4): stop rather than cascade into
         // backward/forward with a thin seed set — resumable, same
         // "Resume v2 Crawl continues anyway" convention as Paper Limit.
+        // CRAWL2_KEYWORD_SHORTFALL marks *why* it stopped, so resumeCrawlV2
+        // can tell "acknowledge and move to backward" apart from "genuinely
+        // still has more queries to run" — without it, Resume just re-enters
+        // this same phase, re-evaluates the identical (already exhausted)
+        // query state, and immediately reports the same shortfall again.
+        props.setProperty('CRAWL2_KEYWORD_SHORTFALL', 'true');
         deleteCrawlV2Trigger();
         updateLogRow(logRow, 'Shortfall');
         setCrawlStatus(sheet, result.message);
@@ -1589,6 +1595,11 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
     props.setProperty('CRAWL2_KEYWORD_SUBPHASE',        'relevance');
     props.setProperty('CRAWL2_KEYWORD_QUERIES_ISSUED',  '0');
     props.setProperty('CRAWL2_KEYWORD_RESULTS_SEEN',    '0');
+    // Script-wide property, not scoped to a single crawl sheet — without
+    // resetting it here, a fresh crawl could inherit 'true' left over from
+    // an earlier crawl's shortfall and have Resume misfire straight past
+    // its own (first, legitimate) keyword pass.
+    props.deleteProperty('CRAWL2_KEYWORD_SHORTFALL');
     props.setProperty('CRAWL2_BACKWARD_IDX',      '0');
     props.setProperty('CRAWL2_BACKWARD_EXAMINED', '0');
     props.setProperty('CRAWL2_BACKWARD_KEPT',     '0');
@@ -1658,6 +1669,19 @@ function resumeCrawlV2() {
     if (!sheet) return 'Crawl sheet "' + sheetName + '" not found — it may have been deleted.';
 
     var phase = props.getProperty('CRAWL2_PHASE') || 'venue';
+
+    // A shortfall stop means the keyword pass already exhausted every query
+    // it had (both sweeps) — re-entering 'keyword' as-is would just
+    // re-evaluate that same exhausted state and immediately report the
+    // identical shortfall again. Resuming here means "continue anyway", so
+    // skip straight to backward with whatever was collected.
+    if (phase === 'keyword' && props.getProperty('CRAWL2_KEYWORD_SHORTFALL') === 'true') {
+      props.deleteProperty('CRAWL2_KEYWORD_SHORTFALL');
+      props.setProperty('CRAWL2_PHASE', 'backward');
+      props.setProperty('CRAWL2_BATCH_NUM', '1');
+      phase = 'backward';
+    }
+
     // Only forward/backward/backward2 have a real Crawled=FALSE queue to
     // check for emptiness — venue/keyword/sweep track progress via their
     // own idx properties and are resumable regardless of countUncrawled().

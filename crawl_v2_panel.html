@@ -855,6 +855,19 @@
         })
         .getLastSnowballFilter();
 
+      // Restores guardPhrases the same way — independent of the groups/
+      // replay chain above (a different field, nothing else ever writes
+      // to it), so no ordering dependency either way. Without this, the
+      // textarea always read empty on a fresh panel load regardless of
+      // what was actually configured, and "Apply Highlight Rule" would
+      // then silently persist that emptiness over a working value.
+      google.script.run
+        .withSuccessHandler(function(guardPhrases) {
+          document.getElementById('guardPhrases').value = (guardPhrases || []).join(', ');
+        })
+        .withFailureHandler(function() {})
+        .getLastCrawlV2GuardPhrases();
+
       function parseResumeCode(raw) {
         try { return JSON.parse(raw); } catch (e) {}
         var start = raw.indexOf('{');

@@ -384,6 +384,28 @@ function escapeRegExpTerm(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Builds the inner alternation for a term-match pattern, tolerant of a
+// trailing regular plural ("s"/"es") and, for terms ending in "child", the
+// irregular "...children" plural too — shared by termsAnyMatchV2,
+// firstMatchingTerm, and buildTermFormulaV2 (crawl_v2.js) so plural
+// handling lives in one place instead of three independently-patched
+// \bTERM\b builders (the exact "more than one implementation" pattern
+// this project's filter consolidation was trying to avoid elsewhere).
+// Caller wraps the return value in \b...\b — only the TRAILING boundary
+// needs plural tolerance; the leading \b is intentionally untouched
+// (verified against Thai/Dubai/Mumbai for "AI" — no false-positive risk
+// there, and this change doesn't touch that side at all).
+//
+// escapeFn: caller-supplied escaper, since JS-RegExp escaping and the
+// Sheets-formula variant (which also needs `"` doubled) differ slightly.
+function buildPluralAwareTermPattern(term, escapeFn) {
+  var t = (term || '').toLowerCase();
+  var mainAlt = escapeFn(t) + '(?:e?s)?';
+  if (!/child$/i.test(t)) return mainAlt;
+  var stem = t.slice(0, t.length - 'child'.length); // '' if term is exactly "child"
+  return '(?:' + mainAlt + '|' + escapeFn(stem) + 'children)';
+}
+
 // ============================================================
 // Fetch candidates
 // ============================================================

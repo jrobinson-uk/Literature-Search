@@ -285,7 +285,7 @@ function termsAnyMatchV2(text, group) {
   var terms = parseGroupTermList(group);
   if (terms.length === 0) return false;
   return terms.some(function(t) {
-    return new RegExp('\\b' + escapeRegExpTerm(t) + '\\b', 'i').test(text);
+    return new RegExp('\\b' + buildPluralAwareTermPattern(t, escapeRegExpTerm) + '\\b', 'i').test(text); // buildPluralAwareTermPattern from crawl.js
   });
 }
 
@@ -294,7 +294,7 @@ function termsAnyMatchV2(text, group) {
 function firstMatchingTerm(text, group) {
   var terms = parseGroupTermList(group);
   for (var i = 0; i < terms.length; i++) {
-    if (new RegExp('\\b' + escapeRegExpTerm(terms[i]) + '\\b', 'i').test(text)) return terms[i];
+    if (new RegExp('\\b' + buildPluralAwareTermPattern(terms[i], escapeRegExpTerm) + '\\b', 'i').test(text)) return terms[i];
   }
   return null;
 }
@@ -362,19 +362,26 @@ function buildMaskedTextExprV2(textExpr, guardPhrases) {
   return expr;
 }
 
+// Composes escapeRegExpTerm (crawl.js) with the extra quote-doubling a
+// Sheets formula string literal needs — the Sheets-specific half of
+// buildPluralAwareTermPattern's escapeFn contract.
+function escapeTermForSheetFormula(s) {
+  return escapeRegExpTerm(s).replace(/"/g, '""'); // escapeRegExpTerm from crawl.js
+}
+
 // v2 variant of snowball.js's shared buildTermFormula, adding guardPhrases
 // masking — not edited in place in snowball.js since that function is
 // shared with the unrelated Snowball feature and v1.
 function buildTermFormulaV2(term, titleColNum, abstractColNum, guardPhrases) {
-  const titleLetter = colToLetter(titleColNum); // from snowball.js
-  const absLetter   = colToLetter(abstractColNum);
-  const safeTerm    = term.replace(/"/g, '""');
-  const regexTerm   = term.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/"/g, '""');
-  const maskedExpr  = buildMaskedTextExprV2('LOWER(t&" "&k)', guardPhrases);
+  const titleLetter  = colToLetter(titleColNum); // from snowball.js
+  const absLetter    = colToLetter(abstractColNum);
+  const safeTerm     = term.replace(/"/g, '""');
+  const innerPattern = buildPluralAwareTermPattern(term, escapeTermForSheetFormula); // from crawl.js
+  const maskedExpr   = buildMaskedTextExprV2('LOWER(t&" "&k)', guardPhrases);
   return '=MAP(A2:A,' + titleLetter + '2:' + titleLetter + ',' + absLetter + '2:' + absLetter + ',LAMBDA(a,t,k,' +
          'IF(ROW(a)=2,"' + safeTerm + '",' +
          'IF(a="","",' +
-         'REGEXMATCH(' + maskedExpr + ',"\\b' + regexTerm + '\\b")' +
+         'REGEXMATCH(' + maskedExpr + ',"\\b' + innerPattern + '\\b")' +
          '))))';
 }
 
@@ -1716,4 +1723,22 @@ function applyCrawlV2Filter(groups, guardPhrases) {
   } catch (e) {
     return 'Error: ' + e.message;
   }
+}
+
+// v2-only counterpart to snowball.js's getLastSnowballFilter() — guardPhrases
+// had no restore path at all, so a fresh panel load always showed the
+// textarea empty regardless of what was actually stored, and "Apply
+// Highlight Rule" then persisted that emptiness over a working value (the
+// bug: bare "Scratch" was matching inside "from scratch" because the guard
+// phrase the user configured never actually reached the runtime). Reads the
+// same CRAWL2_GUARD_PHRASES property startCrawlV2/applyCrawlV2Filter already
+// write, so the panel's displayed value can never drift from what's
+// actually stored for the active/most-recent crawl.
+function getLastCrawlV2GuardPhrases() {
+  var stored = PropertiesService.getScriptProperties().getProperty('CRAWL2_GUARD_PHRASES');
+  if (!stored) return [];
+  try {
+    var parsed = JSON.parse(stored);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) { return []; }
 }

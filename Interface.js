@@ -60,7 +60,7 @@ function showSnowballbar() {
 // "Citation Crawl".
 function showCrawlV2bar() {
   const html = HtmlService.createHtmlOutputFromFile('crawl_v2_panel')
-    .setWidth(450)
+    .setWidth(900)
     .setHeight(700);
   SpreadsheetApp.getUi().showModelessDialog(html, 'Citation Crawl');
 }

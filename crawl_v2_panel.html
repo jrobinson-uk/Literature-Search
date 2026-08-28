@@ -296,9 +296,16 @@
         </div>
 
         <div class="back-options">
-          <div class="check-row">
-            <input type="checkbox" id="matchesOnlyCheck" checked>
-            <label for="matchesOnlyCheck">Only log matching papers (unchecking records FALSE candidates from every phase — venue/keyword/backward/forward — for audit; can produce a lot of extra rows, especially from the keyword pass)</label>
+          <div class="check-row" style="align-items:flex-start;">
+            <span style="min-width:150px;font-weight:600;">Log non-matches</span>
+            <span style="font-size:0.85em;opacity:0.85;">
+              Checked = also record FALSE candidates from that phase (for audit). Unchecked (default) = only log matching papers.
+              Venue sweep is exhaustive by design and usually the noisiest — leave it unchecked unless you specifically want to audit what it's excluding.
+              <label style="margin-right:12px;"><input type="checkbox" id="logNonMatchVenue"> Venue</label>
+              <label style="margin-right:12px;"><input type="checkbox" id="logNonMatchKeyword"> Keyword</label>
+              <label style="margin-right:12px;"><input type="checkbox" id="logNonMatchBackward"> Backward</label>
+              <label><input type="checkbox" id="logNonMatchForward"> Forward</label>
+            </span>
           </div>
           <div class="check-row">
             <input type="checkbox" id="yearBoundCheck" checked onchange="toggleYearRange()">
@@ -693,7 +700,13 @@
         var targetSeeds   = parseInt(document.getElementById('crawlTargetSeeds').value) || 200;
         var groups        = getGroupsFromPanel();
         var guardPhrases  = parseCommaOrNewlineList(document.getElementById('guardPhrases').value);
-        var matchesOnly   = document.getElementById('matchesOnlyCheck').checked;
+        // "Log non-matches" checkboxes are framed positively (checked = record
+        // FALSE candidates too), but startCrawlV2's options are framed as
+        // matchesOnly (true = only log matches) — invert here at the boundary.
+        var matchesOnlyVenue    = !document.getElementById('logNonMatchVenue').checked;
+        var matchesOnlyKeyword  = !document.getElementById('logNonMatchKeyword').checked;
+        var matchesOnlyBackward = !document.getElementById('logNonMatchBackward').checked;
+        var matchesOnlyForward  = !document.getElementById('logNonMatchForward').checked;
         var yearBound     = document.getElementById('yearBoundCheck').checked;
         var yearFrom      = parseInt(document.getElementById('crawlYearFrom').value) || 0;
         var yearTo        = parseInt(document.getElementById('crawlYearTo').value)   || 0;
@@ -720,7 +733,9 @@
           .withSuccessHandler(function(msg) { setStatus(msg); setLoading(false); })
           .withFailureHandler(function(err) { setStatus('Error: ' + err.message); setLoading(false); })
           .startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName,
-                        { matchesOnly: matchesOnly, yearBound: yearBound, yearFrom: yearFrom, yearTo: yearTo,
+                        { matchesOnlyVenue: matchesOnlyVenue, matchesOnlyKeyword: matchesOnlyKeyword,
+                          matchesOnlyBackward: matchesOnlyBackward, matchesOnlyForward: matchesOnlyForward,
+                          yearBound: yearBound, yearFrom: yearFrom, yearTo: yearTo,
                           guardPhrases: guardPhrases,
                           phase0Venues: phase0Venues, phase0YearFrom: phase0YearFrom, phase0YearTo: phase0YearTo,
                           phase1PagesPerQuery: phase1PagesPerQuery, phase1MaxQueries: phase1MaxQueries,

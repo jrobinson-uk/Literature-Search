@@ -1401,7 +1401,17 @@ function crawlV2BatchTrigger() {
     var guardPhrases = JSON.parse(props.getProperty('CRAWL2_GUARD_PHRASES') || '[]');
     var maxDepth    = parseInt(props.getProperty('CRAWL2_MAX_DEPTH')  || '2');
     var maxPapers   = parseInt(props.getProperty('CRAWL2_MAX_PAPERS') || '300');
-    var matchesOnly = props.getProperty('CRAWL2_MATCHES_ONLY') !== 'false';
+    // Per-phase (§ "log non-matches by phase" — venue sweep in particular
+    // can produce a lot of noise since it's exhaustive by design, so it's
+    // useful to record non-matches for keyword/backward/forward without
+    // also flooding the sheet with every non-matching venue paper).
+    // CRAWL2_MATCHES_ONLY (no suffix) is the pre-per-phase property name —
+    // read as a fallback default for crawls started before this change.
+    var legacyMatchesOnly = props.getProperty('CRAWL2_MATCHES_ONLY') !== 'false';
+    var matchesOnlyVenue    = props.getProperty('CRAWL2_MATCHES_ONLY_VENUE')    != null ? props.getProperty('CRAWL2_MATCHES_ONLY_VENUE')    !== 'false' : legacyMatchesOnly;
+    var matchesOnlyKeyword  = props.getProperty('CRAWL2_MATCHES_ONLY_KEYWORD')  != null ? props.getProperty('CRAWL2_MATCHES_ONLY_KEYWORD')  !== 'false' : legacyMatchesOnly;
+    var matchesOnlyBackward = props.getProperty('CRAWL2_MATCHES_ONLY_BACKWARD') != null ? props.getProperty('CRAWL2_MATCHES_ONLY_BACKWARD') !== 'false' : legacyMatchesOnly;
+    var matchesOnlyForward  = props.getProperty('CRAWL2_MATCHES_ONLY_FORWARD')  != null ? props.getProperty('CRAWL2_MATCHES_ONLY_FORWARD')  !== 'false' : legacyMatchesOnly;
     var yearFloor   = parseInt(props.getProperty('CRAWL2_YEAR_FLOOR')   || '0') || 0;
     var yearCeiling = parseInt(props.getProperty('CRAWL2_YEAR_CEILING') || '0') || 0;
     var yearBound   = props.getProperty('CRAWL2_YEAR_BOUND') !== 'false';
@@ -1415,7 +1425,7 @@ function crawlV2BatchTrigger() {
       pagesPerQuery:      parseInt(props.getProperty('CRAWL2_PHASE1_PAGES_PER_QUERY') || String(PHASE1_PAGES_PER_QUERY_DEFAULT)),
       maxQueries:         parseInt(props.getProperty('CRAWL2_PHASE1_MAX_QUERIES') || '0') || 0,
       shortfallTolerance: parseFloat(props.getProperty('CRAWL2_PHASE1_SHORTFALL_TOLERANCE') || String(PHASE1_SHORTFALL_TOLERANCE_DEFAULT)),
-      matchesOnly:        matchesOnly
+      matchesOnly:        matchesOnlyKeyword
       // paginated/dateSweep/noYearFloor deliberately omitted — runKeywordPass
       // defaults all three to true now that they're the standard behaviour,
       // not opt-in flags.
@@ -1425,7 +1435,7 @@ function crawlV2BatchTrigger() {
 
     if (phase === 'venue') {
       setCrawlStatus(sheet, 'Venue sweep — batch ' + batch + '…');
-      result = runVenueSweep(sheet, groups, guardPhrases, phase0Venues, phase0YearFrom, phase0YearTo, maxPapers, matchesOnly);
+      result = runVenueSweep(sheet, groups, guardPhrases, phase0Venues, phase0YearFrom, phase0YearTo, maxPapers, matchesOnlyVenue);
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
@@ -1465,7 +1475,7 @@ function crawlV2BatchTrigger() {
 
     } else if (phase === 'backward') {
       setCrawlStatus(sheet, 'Backward pass — batch ' + batch + '…');
-      result = runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD', matchesOnly);
+      result = runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD', matchesOnlyBackward);
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
@@ -1477,7 +1487,7 @@ function crawlV2BatchTrigger() {
 
     } else if (phase === 'forward') {
       setCrawlStatus(sheet, 'Forward pass — batch ' + batch + '…');
-      result = runForwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, matchesOnly, yearFloor, yearCeiling, yearBound);
+      result = runForwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, matchesOnlyForward, yearFloor, yearCeiling, yearBound);
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
@@ -1492,7 +1502,7 @@ function crawlV2BatchTrigger() {
 
     } else if (phase === 'backward2') {
       setCrawlStatus(sheet, 'Second backward pass — batch ' + batch + '…');
-      result = runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD2', matchesOnly);
+      result = runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD2', matchesOnlyBackward);
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
@@ -1551,7 +1561,15 @@ function crawlV2BatchTrigger() {
 function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName, options) {
   try {
     var opts        = options || {};
-    var matchesOnly = opts.matchesOnly !== false;
+    // Per-phase, not one global switch — venue sweep in particular is
+    // exhaustive-by-design (§3) and can produce far more non-match noise
+    // than keyword/backward/forward, so a venue-heavy run may want non-
+    // matches recorded for keyword/backward/forward but not venue. Each
+    // defaults to true (matches-only) if the panel doesn't send it.
+    var matchesOnlyVenue    = opts.matchesOnlyVenue    !== false;
+    var matchesOnlyKeyword  = opts.matchesOnlyKeyword  !== false;
+    var matchesOnlyBackward = opts.matchesOnlyBackward !== false;
+    var matchesOnlyForward  = opts.matchesOnlyForward  !== false;
     var yearBound   = opts.yearBound   !== false;
 
     // v22 §0.1/§1: venue sweep, the backward dual-pass, and Phase 1's
@@ -1602,7 +1620,10 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
     // backward2 -> sweep) — venue always starts first; it's a harmless
     // no-op if no venues are configured.
     props.setProperty('CRAWL2_PHASE',           'venue');
-    props.setProperty('CRAWL2_MATCHES_ONLY',    matchesOnly ? 'true' : 'false');
+    props.setProperty('CRAWL2_MATCHES_ONLY_VENUE',    matchesOnlyVenue    ? 'true' : 'false');
+    props.setProperty('CRAWL2_MATCHES_ONLY_KEYWORD',  matchesOnlyKeyword  ? 'true' : 'false');
+    props.setProperty('CRAWL2_MATCHES_ONLY_BACKWARD', matchesOnlyBackward ? 'true' : 'false');
+    props.setProperty('CRAWL2_MATCHES_ONLY_FORWARD',  matchesOnlyForward  ? 'true' : 'false');
     props.setProperty('CRAWL2_YEAR_BOUND',      yearBound   ? 'true' : 'false');
     props.setProperty('CRAWL2_YEAR_FLOOR',      String(yearFloor));
     props.setProperty('CRAWL2_YEAR_CEILING',    String(yearCeiling));

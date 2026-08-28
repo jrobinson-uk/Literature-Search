@@ -667,7 +667,8 @@ function idToExternalIdsV2(id) {
 // token — empty string means "start this batch's first page").
 // ============================================================
 
-function runVenueSweep(sheet, groups, guardPhrases, venues, yearFrom, yearTo, maxPapers) {
+function runVenueSweep(sheet, groups, guardPhrases, venues, yearFrom, yearTo, maxPapers, matchesOnly) {
+  matchesOnly = matchesOnly !== false;
   var props = PropertiesService.getScriptProperties();
   var batchIdx  = parseInt(props.getProperty('CRAWL2_VENUE_BATCH_IDX') || '0');
   var token     = props.getProperty('CRAWL2_VENUE_TOKEN') || '';
@@ -721,15 +722,15 @@ function runVenueSweep(sheet, groups, guardPhrases, venues, yearFrom, yearTo, ma
       // no target cap, and no separate year gate here since the venue+year
       // window is already applied server-side via the bulk-search call.
       var verdict = jsMatchesFilterV2((paper.title || '') + ' ' + abstract, groups, guardPhrases);
-      if (!verdict.isMatch) return; // FALSE — skip. REVIEW and TRUE both kept.
+      if (!verdict.isMatch && matchesOnly) return; // FALSE — skip unless matchesOnly=false records it too.
 
       rememberCandidateV2(existing, id, normTitle, doi);
       var row = crawlRowFromS2(paper, 0, '', 'V'); // from crawl.js — Direction='V'
-      if (!verdict.expand) row[CRAWL_COL.CRAWLED - 1] = true; // REVIEW: harvested, never expanded
+      if (!verdict.expand) row[CRAWL_COL.CRAWLED - 1] = true; // REVIEW/FALSE: harvested, never expanded
       newRows.push(row);
       newNotes.push(note);
       newFlags.push(verdict.state === 'REVIEW' ? { flagGroupIndex: verdict.flagGroupIndex, flagTerm: verdict.flagTerm } : null);
-      collected++;
+      if (verdict.isMatch) collected++; // only genuine matches count toward the reported total
     });
 
     if (newRows.length > 0) {
@@ -927,6 +928,7 @@ function runKeywordPass(sheet, groups, guardPhrases, targetSeeds, maxPapers, yea
   var maxQueries = parseInt(opts.maxQueries) || (paginated ? KEYWORD_MAX_QUERIES_PAGINATED : KEYWORD_MAX_QUERIES);
   var shortfallTolerance = (opts.shortfallTolerance != null && opts.shortfallTolerance !== '')
     ? parseFloat(opts.shortfallTolerance) : PHASE1_SHORTFALL_TOLERANCE_DEFAULT;
+  var matchesOnly = opts.matchesOnly !== false;
   var effectiveYearBound = noYearFloor ? false : yearBound;
 
   var props   = PropertiesService.getScriptProperties();
@@ -1014,18 +1016,19 @@ function runKeywordPass(sheet, groups, guardPhrases, targetSeeds, maxPapers, yea
 
       var yearOk  = effectiveYearBound ? isYearInBounds(paper.year, yearFloor, yearCeiling, effectiveYearBound) : true; // from crawl.js
       var verdict = jsMatchesFilterV2((paper.title || '') + ' ' + abstract, groups, guardPhrases);
-      // The keyword pass only ever keeps genuine seeds — there's no "queue"
-      // to record a dead-end non-match against the way forward/backward do,
-      // since a rejected search result was never a candidate row to begin with.
-      if (!verdict.isMatch || !yearOk) return; // FALSE, or year-rejected — skip. REVIEW and TRUE both kept.
+      var keep    = verdict.isMatch && yearOk;   // TRUE or REVIEW, and within the year bound
+      var expand  = verdict.expand  && yearOk;   // TRUE only — REVIEW is always terminal
+      if (!keep && matchesOnly) return; // FALSE, or year-rejected — skip unless matchesOnly=false records it too.
 
       rememberCandidateV2(existing, id, normTitle, doi);
       var row = crawlRowFromS2(paper, 0, '', 'K'); // from crawl.js
-      if (!verdict.expand) row[CRAWL_COL.CRAWLED - 1] = true; // REVIEW: harvested, never expanded
+      if (!expand) row[CRAWL_COL.CRAWLED - 1] = true; // REVIEW/FALSE/year-rejected: harvested, never expanded
       newRows.push(row);
       newNotes.push(note);
-      newFlags.push(verdict.state === 'REVIEW' ? { flagGroupIndex: verdict.flagGroupIndex, flagTerm: verdict.flagTerm } : null);
-      collected++;
+      // Only a genuine REVIEW verdict carries the flag note — see forward
+      // pass's identical comment for why yearOk-driven exclusions don't.
+      newFlags.push((keep && verdict.state === 'REVIEW') ? { flagGroupIndex: verdict.flagGroupIndex, flagTerm: verdict.flagTerm } : null);
+      if (keep) collected++; // only genuine, in-range matches count toward the seed target
     });
 
     if (newRows.length > 0) {
@@ -1089,8 +1092,9 @@ function runKeywordPass(sheet, groups, guardPhrases, targetSeeds, maxPapers, yea
 // propPrefix namespaces this pass's own resumability + instrumentation
 // properties — 'CRAWL2_BACKWARD' for pass 1 (unchanged), 'CRAWL2_BACKWARD2'
 // for the optional second pass.
-function runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, propPrefix) {
+function runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, propPrefix, matchesOnly) {
   propPrefix = propPrefix || 'CRAWL2_BACKWARD';
+  matchesOnly = matchesOnly !== false;
   var startTime = Date.now();
   var props     = PropertiesService.getScriptProperties();
   var idx       = parseInt(props.getProperty(propPrefix + '_IDX') || '0');
@@ -1172,15 +1176,19 @@ function runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yea
 
       var yearOk  = isYearInBounds(ref.year, yearFloor, yearCeiling, yearBound);
       var verdict = jsMatchesFilterV2((ref.title || '') + ' ' + (ref.abstract || ''), groups, guardPhrases);
-      if (!verdict.isMatch || !yearOk) return; // FALSE, or year-rejected — skip. REVIEW and TRUE both kept.
+      var keep    = verdict.isMatch && yearOk;   // TRUE or REVIEW, and within the year bound
+      var expand  = verdict.expand  && yearOk;   // TRUE only — REVIEW is always terminal
+      if (!keep && matchesOnly) return; // FALSE, or year-rejected — skip unless matchesOnly=false records it too.
 
       rememberCandidateV2(existing, refId, normTitle, doi);
       var row = crawlRowFromS2(ref, paperDepth + 1, paperId, 'B'); // from crawl.js
-      if (!verdict.expand) row[CRAWL_COL.CRAWLED - 1] = true; // REVIEW: harvested, never expanded
+      if (!expand) row[CRAWL_COL.CRAWLED - 1] = true; // REVIEW/FALSE/year-rejected: harvested, never expanded
       newRows.push(row);
       newNotes.push(note);
-      newFlags.push(verdict.state === 'REVIEW' ? { flagGroupIndex: verdict.flagGroupIndex, flagTerm: verdict.flagTerm } : null);
-      kept++;
+      // Only a genuine REVIEW verdict carries the flag note — see forward
+      // pass's identical comment for why yearOk-driven exclusions don't.
+      newFlags.push((keep && verdict.state === 'REVIEW') ? { flagGroupIndex: verdict.flagGroupIndex, flagTerm: verdict.flagTerm } : null);
+      if (keep) kept++; // hit-rate stat stays tied to genuine, in-range matches, not rows written
     });
 
     if (newRows.length > 0) {
@@ -1406,7 +1414,8 @@ function crawlV2BatchTrigger() {
     var keywordOpts = {
       pagesPerQuery:      parseInt(props.getProperty('CRAWL2_PHASE1_PAGES_PER_QUERY') || String(PHASE1_PAGES_PER_QUERY_DEFAULT)),
       maxQueries:         parseInt(props.getProperty('CRAWL2_PHASE1_MAX_QUERIES') || '0') || 0,
-      shortfallTolerance: parseFloat(props.getProperty('CRAWL2_PHASE1_SHORTFALL_TOLERANCE') || String(PHASE1_SHORTFALL_TOLERANCE_DEFAULT))
+      shortfallTolerance: parseFloat(props.getProperty('CRAWL2_PHASE1_SHORTFALL_TOLERANCE') || String(PHASE1_SHORTFALL_TOLERANCE_DEFAULT)),
+      matchesOnly:        matchesOnly
       // paginated/dateSweep/noYearFloor deliberately omitted — runKeywordPass
       // defaults all three to true now that they're the standard behaviour,
       // not opt-in flags.
@@ -1416,7 +1425,7 @@ function crawlV2BatchTrigger() {
 
     if (phase === 'venue') {
       setCrawlStatus(sheet, 'Venue sweep — batch ' + batch + '…');
-      result = runVenueSweep(sheet, groups, guardPhrases, phase0Venues, phase0YearFrom, phase0YearTo, maxPapers);
+      result = runVenueSweep(sheet, groups, guardPhrases, phase0Venues, phase0YearFrom, phase0YearTo, maxPapers, matchesOnly);
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
@@ -1456,7 +1465,7 @@ function crawlV2BatchTrigger() {
 
     } else if (phase === 'backward') {
       setCrawlStatus(sheet, 'Backward pass — batch ' + batch + '…');
-      result = runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD');
+      result = runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD', matchesOnly);
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
@@ -1483,7 +1492,7 @@ function crawlV2BatchTrigger() {
 
     } else if (phase === 'backward2') {
       setCrawlStatus(sheet, 'Second backward pass — batch ' + batch + '…');
-      result = runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD2');
+      result = runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD2', matchesOnly);
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);

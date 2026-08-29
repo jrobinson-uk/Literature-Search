@@ -20,6 +20,9 @@ function onOpen() {
     .addItem('Set OpenAlex Email', 'promptForOpenAlexEmail')
     .addItem('Set Semantic Scholar API Key', 'promptForS2ApiKey')
     .addSeparator()
+    .addItem('Debug: Property Storage Usage', 'debugPropertyStorage')
+    .addItem('Debug: Clean Up Legacy v1 Crawl Properties', 'cleanupLegacyCrawlProperties')
+    .addSeparator()
     .addItem('Version ' + VERSION, 'showVersion')
     .addToUi();
     
@@ -106,4 +109,59 @@ function promptForS2ApiKey() {
       ui.alert("Semantic Scholar API key cleared.");
     }
   }
+}
+
+// Diagnostic for PropertiesService's total-store quota (500KB, script-wide
+// across every feature — crawl v2, snowball, saved keys, everything) being
+// exceeded. Reports every currently-stored key with its approximate byte
+// size, largest first, so a "property storage quota" error can be traced
+// to an actual cause instead of guessed at.
+function debugPropertyStorage() {
+  var props = PropertiesService.getScriptProperties().getProperties();
+  var keys = Object.keys(props);
+  var sized = keys.map(function(k) {
+    var v = props[k] || '';
+    return { key: k, bytes: k.length + v.length };
+  }).sort(function(a, b) { return b.bytes - a.bytes; });
+  var total = sized.reduce(function(sum, s) { return sum + s.bytes; }, 0);
+  var lines = sized.slice(0, 25).map(function(s) {
+    return s.key + ': ' + s.bytes + ' bytes';
+  });
+  var msg = 'Total properties: ' + keys.length +
+    '\nTotal approx size: ' + total + ' / ~500,000 bytes\n\n' +
+    'Largest 25:\n' + lines.join('\n');
+  SpreadsheetApp.getUi().alert('Property Storage Usage', msg, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+// Deletes script properties left over from the retired v1 crawler (archived
+// in archive/crawl_v1_full.js — the live pipeline is v2/CRAWL2_* only, see
+// showCrawlV2bar's comment). No current code path reads these; their only
+// effect is counting against the 500KB total-storage quota. Confirmed with
+// the user before deleting anything, since this isn't reversible.
+function cleanupLegacyCrawlProperties() {
+  var ui = SpreadsheetApp.getUi();
+  var legacyKeys = [
+    'CRAWL_ACTIVE_SHEET', 'CRAWL_BACKWARD_DEPTH', 'CRAWL_BACKWARD_DONE',
+    'CRAWL_BACKWARD_IDX', 'CRAWL_BATCH_NUM', 'CRAWL_CONSEC_FAILURES',
+    'CRAWL_DIRECTION', 'CRAWL_EXPANDING_BACKWARD', 'CRAWL_EXPAND_BACKWARD',
+    'CRAWL_LOG_ROW', 'CRAWL_MATCHES_ONLY', 'CRAWL_MAX_DEPTH',
+    'CRAWL_MAX_PAPERS', 'CRAWL_PHASE', 'CRAWL_RUN_BACKWARD',
+    'CRAWL_TRIGGER_ID', 'CRAWL_YEAR_BOUND', 'CRAWL_YEAR_CEILING',
+    'CRAWL_YEAR_FLOOR'
+  ];
+  var props = PropertiesService.getScriptProperties();
+  var present = legacyKeys.filter(function(k) { return props.getProperty(k) !== null; });
+  if (present.length === 0) {
+    ui.alert('No legacy v1 crawl properties found — nothing to clean up.');
+    return;
+  }
+  var response = ui.alert(
+    'Delete legacy v1 crawl properties?',
+    'Found ' + present.length + ' leftover key(s) from the retired v1 crawler:\n\n' +
+    present.join('\n') + '\n\nThese are not read by any current code path. Delete them?',
+    ui.ButtonSet.YES_NO
+  );
+  if (response !== ui.Button.YES) return;
+  present.forEach(function(k) { props.deleteProperty(k); });
+  ui.alert('Deleted ' + present.length + ' legacy propert' + (present.length === 1 ? 'y' : 'ies') + '.');
 }

@@ -223,12 +223,21 @@ function isDuplicateCandidateV2(existing, id, normTitle, doi) {
 // of this batch) AND persists its DOI (if any) into the cross-session
 // CRAWL2_SEEN_DOIS store, since that's the one key that can't be
 // reconstructed later just by re-scanning the sheet.
-function rememberCandidateV2(existing, id, normTitle, doi) {
+function rememberCandidateV2(existing, id, normTitle, doi, persistDoi) {
   existing.ids.add(id);
   if (normTitle) existing.titles.add(normTitle);
   if (doi) {
     existing.dois.add(doi);
-    saveSeenDois(existing.dois);
+    // Only persist to the cross-session store for genuine matches. With a
+    // phase's matchesOnly=false, FALSE candidates get written to the sheet
+    // too (for audit) and still flow through here for in-memory dedup —
+    // but persisting THEIR DOIs as well is what blew PropertiesService's
+    // 500KB total quota on a real run (15k+ recorded non-matches, each
+    // triggering a full saveSeenDois rewrite of the growing array). FALSE
+    // candidates don't need remembering across phases/sessions: the
+    // sheet's own Title/ID columns already prevent re-writing them once
+    // getCrawlV2ExistingKeys re-scans it on the next phase call.
+    if (persistDoi !== false) saveSeenDois(existing.dois);
   }
 }
 
@@ -724,7 +733,7 @@ function runVenueSweep(sheet, groups, guardPhrases, venues, yearFrom, yearTo, ma
       var verdict = jsMatchesFilterV2((paper.title || '') + ' ' + abstract, groups, guardPhrases);
       if (!verdict.isMatch && matchesOnly) return; // FALSE — skip unless matchesOnly=false records it too.
 
-      rememberCandidateV2(existing, id, normTitle, doi);
+      rememberCandidateV2(existing, id, normTitle, doi, verdict.isMatch);
       var row = crawlRowFromS2(paper, 0, '', 'V'); // from crawl.js — Direction='V'
       if (!verdict.expand) row[CRAWL_COL.CRAWLED - 1] = true; // REVIEW/FALSE: harvested, never expanded
       newRows.push(row);
@@ -1020,7 +1029,7 @@ function runKeywordPass(sheet, groups, guardPhrases, targetSeeds, maxPapers, yea
       var expand  = verdict.expand  && yearOk;   // TRUE only — REVIEW is always terminal
       if (!keep && matchesOnly) return; // FALSE, or year-rejected — skip unless matchesOnly=false records it too.
 
-      rememberCandidateV2(existing, id, normTitle, doi);
+      rememberCandidateV2(existing, id, normTitle, doi, keep);
       var row = crawlRowFromS2(paper, 0, '', 'K'); // from crawl.js
       if (!expand) row[CRAWL_COL.CRAWLED - 1] = true; // REVIEW/FALSE/year-rejected: harvested, never expanded
       newRows.push(row);
@@ -1180,7 +1189,7 @@ function runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yea
       var expand  = verdict.expand  && yearOk;   // TRUE only — REVIEW is always terminal
       if (!keep && matchesOnly) return; // FALSE, or year-rejected — skip unless matchesOnly=false records it too.
 
-      rememberCandidateV2(existing, refId, normTitle, doi);
+      rememberCandidateV2(existing, refId, normTitle, doi, keep);
       var row = crawlRowFromS2(ref, paperDepth + 1, paperId, 'B'); // from crawl.js
       if (!expand) row[CRAWL_COL.CRAWLED - 1] = true; // REVIEW/FALSE/year-rejected: harvested, never expanded
       newRows.push(row);
@@ -1299,7 +1308,7 @@ function runForwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, matc
       // what actually excluded it, a "flagged for review" note would be a
       // misleading explanation for why the row is there.
       flagInfos.push((keep && verdict.state === 'REVIEW') ? { flagGroupIndex: verdict.flagGroupIndex, flagTerm: verdict.flagTerm } : null);
-      rememberCandidateV2(existing, cId, normTitle, cDoi);
+      rememberCandidateV2(existing, cId, normTitle, cDoi, keep);
     }
 
     if (matchRows.length > 0) {

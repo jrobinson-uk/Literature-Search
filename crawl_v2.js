@@ -90,6 +90,85 @@ const PHASE1_PAGES_PER_QUERY_DEFAULT     = 3;
 const PHASE1_SHORTFALL_TOLERANCE_DEFAULT = 0.5;
 
 // ============================================================
+// Timestamp / duration / progress header cells (v2-only — row 1, columns
+// 5-10, between the existing Crawl Status pair at cols 3-4 and the filter-
+// group headers that start at CRAWL_FIRST_DETAIL). Not part of CRAWL_COL
+// (the per-row data columns), so this doesn't touch sheet resumability.
+// ============================================================
+const CRAWL2_STARTED_LABEL_COL  = 5;
+const CRAWL2_STARTED_VALUE_COL  = 6;
+const CRAWL2_DURATION_LABEL_COL = 7;
+const CRAWL2_DURATION_VALUE_COL = 8;
+const CRAWL2_PROGRESS_LABEL_COL = 9;
+const CRAWL2_PROGRESS_VALUE_COL = 10;
+
+// Fixed pipeline order, purely for rendering "Phase X/6: <name>" in the
+// header — not read anywhere for control flow (crawlV2BatchTrigger's own
+// if/else chain remains the source of truth for what actually runs next).
+const CRAWL2_PHASE_ORDER = [
+  { key: 'venue',     label: 'Venue sweep' },
+  { key: 'keyword',   label: 'Keyword pass' },
+  { key: 'backward',  label: 'Backward pass' },
+  { key: 'forward',   label: 'Forward pass' },
+  { key: 'backward2', label: 'Second backward pass' },
+  { key: 'sweep',     label: 'Final abstract sweep' }
+];
+
+function formatDurationV2(ms) {
+  if (ms < 0) ms = 0;
+  var totalSeconds = Math.floor(ms / 1000);
+  var days  = Math.floor(totalSeconds / 86400);
+  var hours = Math.floor((totalSeconds % 86400) / 3600);
+  var mins  = Math.floor((totalSeconds % 3600) / 60);
+  var secs  = totalSeconds % 60;
+  if (days  > 0) return days + 'd ' + hours + 'h';
+  if (hours > 0) return hours + 'h ' + mins + 'm';
+  if (mins  > 0) return mins + 'm ' + secs + 's';
+  return secs + 's';
+}
+
+function formatTimestampV2(date) {
+  var pad = function(n) { return n.toString().padStart(2, '0'); };
+  return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) +
+    ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes());
+}
+
+// Writes the three label cells once (crawl creation only) — values are
+// filled in by updateCrawlV2Timing as the crawl actually runs.
+function setupCrawlV2TimingHeaders(sheet) {
+  sheet.getRange(1, CRAWL2_STARTED_LABEL_COL)
+    .setValue('Started').setFontWeight('bold').setFontColor('#555555').setFontSize(10);
+  sheet.getRange(1, CRAWL2_DURATION_LABEL_COL)
+    .setValue('Duration').setFontWeight('bold').setFontColor('#555555').setFontSize(10);
+  sheet.getRange(1, CRAWL2_PROGRESS_LABEL_COL)
+    .setValue('Progress').setFontWeight('bold').setFontColor('#555555').setFontSize(10);
+  sheet.setColumnWidth(CRAWL2_STARTED_VALUE_COL,  110);
+  sheet.setColumnWidth(CRAWL2_DURATION_VALUE_COL,  70);
+  sheet.setColumnWidth(CRAWL2_PROGRESS_VALUE_COL, 220);
+}
+
+// Refreshes Duration + Progress on every batch-trigger firing (Started is
+// written once, at crawl creation, and never changes). Wall-clock elapsed
+// since crawl start, including any time spent waiting for a manual Resume —
+// "how long has this crawl been going" rather than pure execution time.
+function updateCrawlV2Timing(sheet, phase) {
+  var props    = PropertiesService.getScriptProperties();
+  var startIso = props.getProperty('CRAWL2_START_TIME');
+  if (startIso) {
+    var elapsed = Date.now() - new Date(startIso).getTime();
+    sheet.getRange(1, CRAWL2_DURATION_VALUE_COL).setValue(formatDurationV2(elapsed));
+  }
+  var idx = -1;
+  for (var i = 0; i < CRAWL2_PHASE_ORDER.length; i++) {
+    if (CRAWL2_PHASE_ORDER[i].key === phase) { idx = i; break; }
+  }
+  var progressText = (idx >= 0)
+    ? 'Phase ' + (idx + 1) + '/' + CRAWL2_PHASE_ORDER.length + ': ' + CRAWL2_PHASE_ORDER[idx].label
+    : (phase === 'complete' ? 'Complete' : (phase || ''));
+  sheet.getRange(1, CRAWL2_PROGRESS_VALUE_COL).setValue(progressText);
+}
+
+// ============================================================
 // Trigger / status management (own namespace, mirrors crawl.js)
 // ============================================================
 
@@ -153,6 +232,7 @@ function setupCrawlV2Sheet(sheet, seedLabel) {
   // else needs overriding here. applyCrawlV2Highlight below replaces v1's
   // single green row rule with a refined green/orange pair once real
   // filter groups exist.
+  setupCrawlV2TimingHeaders(sheet);
 }
 
 // ============================================================
@@ -1405,6 +1485,7 @@ function crawlV2BatchTrigger() {
     if (!sheet) { deleteCrawlV2Trigger(); return; }
 
     var phase       = props.getProperty('CRAWL2_PHASE') || 'venue';
+    updateCrawlV2Timing(sheet, phase); // refresh Duration + Progress on every firing, before this batch's own work
     var batch       = parseInt(props.getProperty('CRAWL2_BATCH_NUM') || '1');
     var groups      = JSON.parse(props.getProperty('CRAWL2_FILTER_GROUPS') || '[]');
     var guardPhrases = JSON.parse(props.getProperty('CRAWL2_GUARD_PHRASES') || '[]');
@@ -1533,6 +1614,7 @@ function crawlV2BatchTrigger() {
         deleteCrawlV2Trigger();
         updateLogRow(logRow, 'Complete');
         setCrawlStatus(sheet, 'Complete (' + sweepTotal + ' abstract(s) recovered on final sweep)');
+        updateCrawlV2Timing(sheet, 'complete'); // final Duration freeze + Progress = "Complete"
       }
     }
 
@@ -1618,7 +1700,11 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
     var sheet = ss.insertSheet(sheetName);
     setupCrawlV2Sheet(sheet, seedLabel);
 
+    var startTime = new Date();
+    sheet.getRange(1, CRAWL2_STARTED_VALUE_COL).setValue(formatTimestampV2(startTime));
+
     var props = PropertiesService.getScriptProperties();
+    props.setProperty('CRAWL2_START_TIME',      startTime.toISOString());
     props.setProperty('CRAWL2_ACTIVE_SHEET',    sheetName);
     props.setProperty('CRAWL2_MAX_DEPTH',       String(maxDepth  || 2)); // depth 2 default (v22 §11.5 — was 3)
     props.setProperty('CRAWL2_MAX_PAPERS',      String(maxPapers || 300));

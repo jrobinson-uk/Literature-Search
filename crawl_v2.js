@@ -220,6 +220,82 @@ function cancelCrawlV2() {
   ui.alert('v2 crawl cancelled.');
 }
 
+// Read-only progress check for whichever phase is currently active — works
+// on ANY running crawl, including ones started before the Started/
+// Duration/Progress header cells existed, by re-deriving the same
+// eligibility/queue logic each phase uses internally (mirrors
+// runBackwardPassV2's own paperIds-building loop for backward/backward2).
+// Never writes to properties or the sheet — safe to run mid-crawl.
+function debugCrawlV2Progress() {
+  var ui = SpreadsheetApp.getUi();
+  var props = PropertiesService.getScriptProperties();
+  var sheetName = props.getProperty('CRAWL2_ACTIVE_SHEET');
+  if (!sheetName) { ui.alert('No active v2 crawl found.'); return; }
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
+  if (!sheet) { ui.alert('Crawl sheet "' + sheetName + '" not found.'); return; }
+
+  var phase       = props.getProperty('CRAWL2_PHASE') || 'venue';
+  var batch       = parseInt(props.getProperty('CRAWL2_BATCH_NUM') || '1');
+  var maxDepth    = parseInt(props.getProperty('CRAWL2_MAX_DEPTH') || '2');
+  var groups      = JSON.parse(props.getProperty('CRAWL2_FILTER_GROUPS') || '[]');
+  var guardPhrases = JSON.parse(props.getProperty('CRAWL2_GUARD_PHRASES') || '[]');
+  var minutesPerBatch = CRAWL2_TIME_LIMIT_MS / 60000;
+
+  var phaseIdx = -1;
+  for (var pi = 0; pi < CRAWL2_PHASE_ORDER.length; pi++) {
+    if (CRAWL2_PHASE_ORDER[pi].key === phase) { phaseIdx = pi; break; }
+  }
+  var lines = [
+    'Phase: ' + (phaseIdx >= 0
+      ? ('Phase ' + (phaseIdx + 1) + '/' + CRAWL2_PHASE_ORDER.length + ' — ' + CRAWL2_PHASE_ORDER[phaseIdx].label)
+      : phase),
+    'Batch: ' + batch + ' (each batch runs up to ~' + minutesPerBatch + ' min before re-triggering)'
+  ];
+
+  if (phase === 'backward' || phase === 'backward2') {
+    var propPrefix = (phase === 'backward2') ? 'CRAWL2_BACKWARD2' : 'CRAWL2_BACKWARD';
+    var idx      = parseInt(props.getProperty(propPrefix + '_IDX')      || '0');
+    var examined = parseInt(props.getProperty(propPrefix + '_EXAMINED') || '0');
+    var kept     = parseInt(props.getProperty(propPrefix + '_KEPT')     || '0');
+
+    var lastRow = getCrawlLastDataRow(sheet);
+    var total = 0;
+    if (lastRow >= 3) {
+      var data = sheet.getRange(3, 1, lastRow - 2, CRAWL_NUM_COLS).getValues();
+      data.forEach(function(row) {
+        var id = String(row[CRAWL_COL.ID - 1] || '').trim();
+        if (!id) return;
+        var depth = parseInt(row[CRAWL_COL.DEPTH - 1]) || 0;
+        if (depth >= maxDepth) return;
+        var title    = String(row[CRAWL_COL.TITLE - 1]    || '');
+        var abstract = String(row[CRAWL_COL.ABSTRACT - 1] || '');
+        if (!jsMatchesFilterV2(title + ' ' + abstract, groups, guardPhrases).expand) return;
+        total++;
+      });
+    }
+    lines.push('Source papers examined: ' + idx + ' / ' + total);
+    lines.push('References examined so far: ' + examined + ' (kept: ' + kept + ')');
+    if (idx > 0 && total > idx) {
+      var minutesSoFar   = batch * minutesPerBatch;
+      var minutesPerSource = minutesSoFar / idx;
+      var remainingMin   = Math.round(minutesPerSource * (total - idx));
+      lines.push('Rough estimate: ~' + remainingMin + ' more minute(s) at the current pace — ' +
+        'very approximate, since it depends on how many references each remaining paper has.');
+    }
+  } else if (phase === 'forward') {
+    lines.push('Papers still queued (Crawled=FALSE): ' + countUncrawled(sheet));
+  } else if (phase === 'keyword') {
+    lines.push('Seeds collected: ' + (props.getProperty('CRAWL2_KEYWORD_COLLECTED') || '0') +
+      ' / ' + (props.getProperty('CRAWL2_TARGET_SEEDS') || '?'));
+  } else if (phase === 'venue') {
+    lines.push('Seed papers collected so far: ' + (props.getProperty('CRAWL2_VENUE_COUNT') || '0'));
+  } else if (phase === 'sweep') {
+    lines.push('Abstracts recovered so far: ' + (props.getProperty('CRAWL2_SWEEP_RECOVERED') || '0'));
+  }
+
+  ui.alert('Citation Crawl Progress', lines.join('\n'), ui.ButtonSet.OK);
+}
+
 // ============================================================
 // Sheet setup — reuses v1's layout entirely
 // ============================================================

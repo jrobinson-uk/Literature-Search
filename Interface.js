@@ -15,6 +15,7 @@ function onOpen() {
     .addSeparator()
     .addItem('Load Selected Log Row', 'resumeFromLog')
     .addItem('Cancel Crawl', 'cancelCrawlV2')
+    .addItem('Show Crawl Progress', 'debugCrawlV2Progress')
     .addSeparator()
     .addItem('Set SerpAPI Key', 'promptForKey')
     .addItem('Set OpenAlex Email', 'promptForOpenAlexEmail')

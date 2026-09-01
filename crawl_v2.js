@@ -948,11 +948,18 @@ function runVenueSweep(sheet, groups, guardPhrases, venues, yearFrom, yearTo, ma
       applyAbstractNotes(sheet, writeStart, newNotes.slice(0, canAdd));
       applyFlagReasonNotes(sheet, writeStart, newFlags.slice(0, canAdd));
       if (canAdd < newRows.length) {
+        // Cap reached — nothing more venue sweep can usefully do (unlike
+        // forward, there's no "existing discovered queue" to keep draining
+        // without adding rows), so finish this phase now rather than
+        // stopping and requiring a manual Resume. Returning 'paper-limit'
+        // here used to re-fetch and re-hit this exact same page on every
+        // Resume (batchIdx/token hadn't advanced yet), repeating the
+        // identical message forever instead of progressing.
         props.setProperty('CRAWL2_VENUE_BATCH_IDX', String(batchIdx));
-        props.setProperty('CRAWL2_VENUE_TOKEN', token);
+        props.setProperty('CRAWL2_VENUE_TOKEN', '');
         props.setProperty('CRAWL2_VENUE_COUNT', String(collected));
-        return { status: 'paper-limit', message: 'Paper limit (' + maxPapers + ') reached during venue sweep — ' +
-               'click Resume v2 Crawl to continue once you\'ve reviewed the sheet.' };
+        return { status: 'complete', message: 'Paper limit (' + maxPapers + ') reached during venue sweep — ' +
+               collected + ' seed(s) collected before the cap; moving on without adding more.' };
       }
     }
 
@@ -1462,6 +1469,21 @@ function runForwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, matc
       continue;
     }
 
+    // Already at/over the cap (set once below, the first time this happens)
+    // — keep draining the rest of the already-discovered queue (mark
+    // Crawled=true) without fetching candidates for it at all, since
+    // nothing found could ever be written anyway. Skipping the fetch here
+    // (rather than fetching and then discarding at the write step) avoids
+    // burning an S2 call — and an API rate-limit backoff — per remaining
+    // queued paper for no benefit. This is what lets the crawl finish
+    // unattended once the cap is hit, instead of requiring a fresh manual
+    // Resume for every single subsequent paper in the queue.
+    if (getCrawlLastDataRow(sheet) - 2 >= maxPapers) {
+      sheet.getRange(sheetRow, CRAWL_COL.CRAWLED).setValue(true);
+      processed++;
+      continue;
+    }
+
     var candidates = [];
     try {
       candidates = fetchForwardCandidates(id, title); // from crawl.js
@@ -1517,13 +1539,19 @@ function runForwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, matc
       applyAbstractNotes(sheet, writeStart, abstractNotes.slice(0, canAdd));
       applyFlagReasonNotes(sheet, writeStart, flagInfos.slice(0, canAdd));
       if (canAdd < matchRows.length) {
-        sheet.getRange(sheetRow, CRAWL_COL.CRAWLED).setValue(true);
-        processed++;
+        // First time crossing maxPapers — surface it once (status + log),
+        // then keep going rather than stopping: every iteration from here
+        // on takes the "already at/over the cap" branch above, so the rest
+        // of the existing queue still gets marked Crawled=true (and its own
+        // forward candidates discarded) automatically, with no further
+        // rows added and no manual Resume needed for the crawl to reach
+        // Complete. Doesn't return, doesn't delete the trigger — this is a
+        // one-time notification, not a stop condition any more.
         updateCrawlMatchedCites(sheet);
         var logRowPL = parseInt(PropertiesService.getScriptProperties().getProperty('CRAWL2_LOG_ROW') || '0') || 0;
         updateLogRow(logRowPL, 'Paper Limit');
-        return { status: 'paper-limit', message: "Paper limit (" + maxPapers + ") reached. The queue still has unprocessed papers — " +
-               "click Resume Crawl v2 to continue (existing queue only; no new papers will be added)." };
+        setCrawlStatus(sheet, 'Paper limit (' + maxPapers + ') reached — no further papers will be added, but the ' +
+          'crawl is continuing to process the rest of the existing queue automatically.');
       }
     }
 
@@ -1655,10 +1683,11 @@ function crawlV2BatchTrigger() {
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
-      } else if (result.status === 'paper-limit') {
-        deleteCrawlV2Trigger();
-        setCrawlStatus(sheet, result.message);
       } else {
+        // 'complete' covers both a genuinely finished sweep and the
+        // paper-limit-reached case (runVenueSweep returns 'complete' for
+        // both now — nothing more for this phase to do once the cap is
+        // hit, same as a normal finish) — either way, move on to keyword.
         props.setProperty('CRAWL2_PHASE', 'keyword');
         props.setProperty('CRAWL2_BATCH_NUM', '1');
         setCrawlStatus(sheet, result.message + ' — starting keyword pass…');
@@ -1707,10 +1736,11 @@ function crawlV2BatchTrigger() {
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
-      } else if (result.status === 'paper-limit') {
-        deleteCrawlV2Trigger();
-        setCrawlStatus(sheet, result.message);
       } else {
+        // 'complete' covers both a genuine finish and having hit maxPapers
+        // partway through (runForwardPassV2 now drains the rest of the
+        // queue itself once the cap is reached, rather than stopping) —
+        // either way, move on to the second backward pass.
         props.setProperty('CRAWL2_PHASE', 'backward2');
         props.setProperty('CRAWL2_BATCH_NUM', '1');
         setCrawlStatus(sheet, result.message + ' — starting second backward pass (over the now-larger match set)…');

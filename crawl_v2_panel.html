@@ -286,14 +286,27 @@
 
         <div class="limits-row">
           <div>
-            <label>Max depth</label>
+            <label>Max depth (forward)</label>
             <input type="number" id="crawlMaxDepth" value="2" min="1" max="5">
+          </div>
+          <div>
+            <label>Backward depth</label>
+            <input type="number" id="crawlBackwardDepth" value="1" min="1" max="5">
           </div>
           <div>
             <label>Max papers</label>
             <input type="number" id="crawlMaxPapers" value="300" min="1" max="2000">
           </div>
         </div>
+        <p class="hint">
+          Backward depth is separate from (and defaults shallower than) forward's max depth —
+          backward chases references (older work), which compounds fast into ancient, generic
+          citation noise the more generations it's allowed to recurse. A backward depth of 1 means
+          only the original venue/keyword-found papers' own references get pulled; those
+          references' own references don't. Forward still explores from whatever backward finds
+          (including older foundational work) up to the full max depth above — that's how an older
+          paper backward turns up still generates forward links to modern citing work.
+        </p>
 
         <div class="back-options">
           <div class="check-row" style="align-items:flex-start;">
@@ -699,6 +712,7 @@
       function startCrawl() {
         var crawlName     = document.getElementById('crawlName').value.trim();
         var maxDepth      = parseInt(document.getElementById('crawlMaxDepth').value)  || 2;
+        var backwardDepth = parseInt(document.getElementById('crawlBackwardDepth').value) || 1;
         var maxPapers     = parseInt(document.getElementById('crawlMaxPapers').value) || 300;
         var targetSeeds   = parseInt(document.getElementById('crawlTargetSeeds').value) || 200;
         var groups        = getGroupsFromPanel();
@@ -738,6 +752,7 @@
           .startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName,
                         { matchesOnlyVenue: matchesOnlyVenue, matchesOnlyKeyword: matchesOnlyKeyword,
                           matchesOnlyBackward: matchesOnlyBackward, matchesOnlyForward: matchesOnlyForward,
+                          backwardMaxDepth: backwardDepth,
                           yearBound: yearBound, yearFrom: yearFrom, yearTo: yearTo,
                           guardPhrases: guardPhrases,
                           phase0Venues: phase0Venues, phase0YearFrom: phase0YearFrom, phase0YearTo: phase0YearTo,

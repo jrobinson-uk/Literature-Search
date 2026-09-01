@@ -1609,6 +1609,13 @@ function crawlV2BatchTrigger() {
     var groups      = JSON.parse(props.getProperty('CRAWL2_FILTER_GROUPS') || '[]');
     var guardPhrases = JSON.parse(props.getProperty('CRAWL2_GUARD_PHRASES') || '[]');
     var maxDepth    = parseInt(props.getProperty('CRAWL2_MAX_DEPTH')  || '2');
+    // Backward's own depth, decoupled from forward's — backward chases
+    // REFERENCES (older work), which compounds fast into ancient, generic
+    // citation noise (statistics-method papers, foundational psychology,
+    // etc. cited alongside the real topical references) the more
+    // generations it's allowed to recurse. Defaults to maxDepth (the old,
+    // shared-depth behaviour) for crawls started before this existed.
+    var backwardMaxDepth = parseInt(props.getProperty('CRAWL2_BACKWARD_MAX_DEPTH') || String(maxDepth));
     var maxPapers   = parseInt(props.getProperty('CRAWL2_MAX_PAPERS') || '300');
     // Per-phase (§ "log non-matches by phase" — venue sweep in particular
     // can produce a lot of noise since it's exhaustive by design, so it's
@@ -1684,7 +1691,7 @@ function crawlV2BatchTrigger() {
 
     } else if (phase === 'backward') {
       setCrawlStatus(sheet, 'Backward pass — batch ' + batch + '…');
-      result = runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD', matchesOnlyBackward);
+      result = runBackwardPassV2(sheet, groups, guardPhrases, backwardMaxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD', matchesOnlyBackward);
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
@@ -1711,7 +1718,7 @@ function crawlV2BatchTrigger() {
 
     } else if (phase === 'backward2') {
       setCrawlStatus(sheet, 'Second backward pass — batch ' + batch + '…');
-      result = runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD2', matchesOnlyBackward);
+      result = runBackwardPassV2(sheet, groups, guardPhrases, backwardMaxDepth, maxPapers, yearFloor, yearCeiling, yearBound, 'CRAWL2_BACKWARD2', matchesOnlyBackward);
       if (result.status === 'time-limit') {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
@@ -1781,6 +1788,14 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
     var matchesOnlyBackward = opts.matchesOnlyBackward !== false;
     var matchesOnlyForward  = opts.matchesOnlyForward  !== false;
     var yearBound   = opts.yearBound   !== false;
+    // Backward's own depth, decoupled from forward's maxDepth — defaults to
+    // 1 (only the original venue/keyword-found papers' own references are
+    // examined; their references' references are not) so backward chasing
+    // can't compound into ancient, generic citation noise. Forward keeps
+    // exploring from whatever backward finds (including older foundational
+    // work), up to the full maxDepth — that's how an older paper backward
+    // turns up still generates forward links to modern citing work.
+    var backwardMaxDepth = parseInt(opts.backwardMaxDepth) || 1;
 
     // v22 §0.1/§1: venue sweep, the backward dual-pass, and Phase 1's
     // pagination/date-sweep/no-floor are now the standard pipeline, not
@@ -1826,6 +1841,7 @@ function startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName
     props.setProperty('CRAWL2_START_TIME',      startTime.toISOString());
     props.setProperty('CRAWL2_ACTIVE_SHEET',    sheetName);
     props.setProperty('CRAWL2_MAX_DEPTH',       String(maxDepth  || 2)); // depth 2 default (v22 §11.5 — was 3)
+    props.setProperty('CRAWL2_BACKWARD_MAX_DEPTH', String(backwardMaxDepth));
     props.setProperty('CRAWL2_MAX_PAPERS',      String(maxPapers || 300));
     props.setProperty('CRAWL2_TARGET_SEEDS',    String(targetN));
     props.setProperty('CRAWL2_FILTER_GROUPS',   JSON.stringify(groups)); // v2's OWN key — not shared with v1/Snowball

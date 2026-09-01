@@ -334,8 +334,8 @@
         </p>
         <p class="hint">
           Backward runs to the same "Max depth" as forward — only papers whose Filter Match is
-          TRUE expand (REVIEW rows are harvested but never expanded either direction — see the
-          Filter section below).
+          TRUE <em>and</em> Review is FALSE expand (rows flagged for review are harvested but
+          never expanded either direction — see the Filter section below).
         </p>
         <p class="hint">
           Abstract resolution stays Semantic Scholar + OpenAlex only, but persists for longer
@@ -357,9 +357,12 @@
           Each card is an <strong>AND</strong> condition; terms within a card are <strong>OR</strong>'d.
           Tick <strong>NOT</strong> for a group, then choose what tripping it means: <strong>Exclude</strong>
           (hard veto — Filter Match becomes FALSE) or <strong>Flag for review</strong> (Filter Match
-          becomes REVIEW — the paper is kept and harvested, but never queued for backward/forward
-          expansion, pending human triage). At least one non-NOT group with terms is required —
-          the keyword pass searches on these.
+          stays TRUE, but the separate Review column becomes TRUE too — the paper is kept and
+          harvested, but never queued for backward/forward expansion, pending human triage).
+          Filter Match and Review are two independent boolean columns on the sheet: Filter Match
+          alone answers "is this paper in scope" (TRUE even if also flagged); Review answers
+          "does a human need to look at this one." At least one non-NOT group with terms is
+          required — the keyword pass searches on these.
         </p>
         <div id="groupsContainer"></div>
         <button id="addGroupBtn" onclick="addGroup()">+ Add AND Group</button>

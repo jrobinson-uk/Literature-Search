@@ -17,10 +17,10 @@
 // ============================================================
 
 // Cols 1-14 are "owned" data/formula columns.
-// Col 15 is "In-Sheet Links" — a MAP formula column, not in CRAWL_HEADERS.
-// Term-helper columns start at CRAWL_FIRST_DETAIL_COL (16).
-const CRAWL_HEADERS  = ["Depth","Crawled","Year","Title","Authors","Type","Venue","Abstract","ID","Cited By","Filter Match","Found From","Matched Cites","Direction"];
-const CRAWL_NUM_COLS = CRAWL_HEADERS.length; // 14
+// Col 16 is "In-Sheet Links" — a MAP formula column, not in CRAWL_HEADERS.
+// Term-helper columns start at CRAWL_FIRST_DETAIL_COL (17).
+const CRAWL_HEADERS  = ["Depth","Crawled","Year","Title","Authors","Type","Venue","Abstract","ID","Cited By","Filter Match","Review","Found From","Matched Cites","Direction"];
+const CRAWL_NUM_COLS = CRAWL_HEADERS.length; // 15
 
 const CRAWL_COL = {
   DEPTH:         1,
@@ -33,29 +33,37 @@ const CRAWL_COL = {
   ABSTRACT:      8,
   ID:            9,
   CITED_BY:      10,
-  FILTER_MATCH:  11,
-  FOUND_FROM:    12,  // parent paper ID (written at crawl time)
-  MATCHED_CITES: 13, // in-sheet child IDs (written by updateCrawlMatchedCites)
-  DIRECTION:     14  // "V" = venue sweep, "K" = keyword pass, "B" = backward pass, "F" = forward pass
+  FILTER_MATCH:  11, // pure boolean — TRUE iff in scope (every positive group matched, no exclude-mode NOT group tripped), independent of REVIEW_FLAG
+  REVIEW_FLAG:   12, // pure boolean — TRUE iff FILTER_MATCH=TRUE AND a review-mode NOT group also tripped (needs human triage)
+  FOUND_FROM:    13,  // parent paper ID (written at crawl time)
+  MATCHED_CITES: 14, // in-sheet child IDs (written by updateCrawlMatchedCites)
+  DIRECTION:     15  // "V" = venue sweep, "K" = keyword pass, "B" = backward pass, "F" = forward pass
 };
 
-// Col 15: In-Sheet Links — MAP formula; sits after Direction and before term helpers.
-// Counts how many papers in the sheet list this paper as their Found From parent (col L).
-const CRAWL_IN_SHEET_LINKS_COL = CRAWL_COL.DIRECTION + 1; // 15
+// Col 16: In-Sheet Links — MAP formula; sits after Direction and before term helpers.
+// Counts how many papers in the sheet list this paper as their Found From parent (col M).
+const CRAWL_IN_SHEET_LINKS_COL = CRAWL_COL.DIRECTION + 1; // 16
 const CRAWL_IN_SHEET_LINKS_FORMULA =
   '=MAP(A2:A,I2:I,LAMBDA(a,id,' +
   'IF(ROW(a)=2,"In-Sheet Links",' +
-  'IF(a="","",COUNTIF(L$3:L,id)))))';
+  'IF(a="","",COUNTIF(M$3:M,id)))))';
 
 // Term-helper columns written by the highlight applier start here.
-const CRAWL_FIRST_DETAIL_COL = CRAWL_IN_SHEET_LINKS_COL + 1; // 16
+const CRAWL_FIRST_DETAIL_COL = CRAWL_IN_SHEET_LINKS_COL + 1; // 17
 
-// Column letter for FILTER_MATCH (col 11 = K) used in CF formulas.
+// Column letters for FILTER_MATCH (col 11 = K) and REVIEW_FLAG (col 12 = L)
+// used in CF formulas. NOTE: these, and the hardcoded "M" in
+// CRAWL_IN_SHEET_LINKS_FORMULA above (Found From), are literal column
+// letters, not derived from CRAWL_COL — if either column's position ever
+// moves again, these must be updated by hand alongside it.
 const CRAWL_FILTER_MATCH_COL_LETTER = "K";
+const CRAWL_REVIEW_FLAG_COL_LETTER  = "L";
 
-// Default MAP formula — evaluates to FALSE until a real filter is applied.
+// Default MAP formulas — evaluate to FALSE until a real filter is applied.
 const CRAWL_DEFAULT_FILTER_FORMULA =
   '=MAP(A2:A,H2:H,LAMBDA(a,h,IF(ROW(a)=2,"Filter Match",IF(a<>"",FALSE,""))))';
+const CRAWL_DEFAULT_REVIEW_FORMULA =
+  '=MAP(A2:A,H2:H,LAMBDA(a,h,IF(ROW(a)=2,"Review",IF(a<>"",FALSE,""))))';
 
 const CRAWL_ROW_HEIGHT = 60;
 
@@ -148,7 +156,7 @@ function setupCrawlSheet(sheet, direction, seedTitle) {
     .setValue("Starting…").setBackground("#f4b400").setFontColor("#333333")
     .setFontWeight("bold").setFontSize(10);
 
-  // Row 2 headers — three segments because cols 11 and 14 are MAP formulas, not static text.
+  // Row 2 headers — three segments because cols 11, 12, and 16 are MAP formulas, not static text.
   // Cols 1-10: static text (Depth … Cited By)
   sheet.getRange(2, 1, 1, CRAWL_COL.CITED_BY)
     .setValues([CRAWL_HEADERS.slice(0, CRAWL_COL.CITED_BY)])
@@ -157,11 +165,15 @@ function setupCrawlSheet(sheet, direction, seedTitle) {
   sheet.getRange(2, CRAWL_COL.FILTER_MATCH)
     .setFormula(CRAWL_DEFAULT_FILTER_FORMULA)
     .setFontWeight("bold").setBackground("#4285f4").setFontColor("white");
-  // Cols 12-14: static text (Found From, Matched Cites, Direction)
+  // Col 12: Review MAP formula
+  sheet.getRange(2, CRAWL_COL.REVIEW_FLAG)
+    .setFormula(CRAWL_DEFAULT_REVIEW_FORMULA)
+    .setFontWeight("bold").setBackground("#4285f4").setFontColor("white");
+  // Cols 13-15: static text (Found From, Matched Cites, Direction)
   sheet.getRange(2, CRAWL_COL.FOUND_FROM, 1, 3)
     .setValues([CRAWL_HEADERS.slice(CRAWL_COL.FOUND_FROM - 1)])
     .setFontWeight("bold").setBackground("#4285f4").setFontColor("white");
-  // Col 15: In-Sheet Links MAP formula
+  // Col 16: In-Sheet Links MAP formula
   sheet.getRange(2, CRAWL_IN_SHEET_LINKS_COL)
     .setFormula(CRAWL_IN_SHEET_LINKS_FORMULA)
     .setFontWeight("bold").setBackground("#4285f4").setFontColor("white");
@@ -179,7 +191,8 @@ function setupCrawlSheet(sheet, direction, seedTitle) {
   sheet.setColumnWidth(CRAWL_COL.ABSTRACT,  400);
   sheet.setColumnWidth(CRAWL_COL.ID,        130);
   sheet.setColumnWidth(CRAWL_COL.CITED_BY,          80);
-  sheet.setColumnWidth(CRAWL_COL.FILTER_MATCH,      110);
+  sheet.setColumnWidth(CRAWL_COL.FILTER_MATCH,      90);
+  sheet.setColumnWidth(CRAWL_COL.REVIEW_FLAG,       90);
   sheet.setColumnWidth(CRAWL_COL.FOUND_FROM,         160);
   sheet.setColumnWidth(CRAWL_COL.MATCHED_CITES,      260);
   sheet.setColumnWidth(CRAWL_COL.DIRECTION,           55);
@@ -354,6 +367,7 @@ function crawlRowFromS2(paper, depth, parentId, dir) {
     id,
     paper.citationCount || 0,
     "",               // Filter Match — spilled from row 2 formula
+    "",               // Review — spilled from row 2 formula
     parentId || "",   // Found From
     "",               // Matched Cites — populated by updateCrawlMatchedCites
     dir || "F"        // Direction

@@ -501,15 +501,21 @@ function jsMatchesFilterV2(rawText, groups, guardPhrases) {
 }
 
 // ============================================================
-// Filter Match column (tri-state text) + row highlight
+// Filter Match + Review columns (two pure booleans) + row highlight
 //
-// Column K now holds "TRUE" / "FALSE" / "REVIEW" as literal text (v22 §2),
-// computed by a sheet formula that mirrors jsMatchesFilterV2's rules
-// exactly: positive groups gate first, then exclude-mode NOT groups, then
-// review-mode NOT groups. The per-term helper columns feeding it apply the
-// same guardPhrases masking as the JS side (buildTermFormulaV2), so the
-// live display can't drift from the write-time decision the way two
-// separately-evolving implementations could.
+// Column K (Filter Match) and column L (Review) each hold a real Sheets
+// boolean, computed by sheet formulas that mirror jsMatchesFilterV2's rules
+// exactly: K = TRUE iff every positive group matched and no exclude-mode
+// NOT group tripped (jsMatchesFilterV2's `isMatch` — in/out of scope,
+// independent of any review flag); L = TRUE iff K is also TRUE AND a
+// review-mode NOT group tripped (jsMatchesFilterV2's `state === 'REVIEW'`).
+// Was a single tri-state text column (TRUE/FALSE/REVIEW) through v22; split
+// into these two orthogonal booleans so an external check can read K alone
+// for a definitive in-scope yes/no, with L as a separate human-triage flag.
+// The per-term helper columns feeding both apply the same guardPhrases
+// masking as the JS side (buildTermFormulaV2), so the live display can't
+// drift from the write-time decision the way two separately-evolving
+// implementations could.
 // ============================================================
 
 // Sheet-formula equivalent of maskGuardPhrases — nests REGEXREPLACE calls,
@@ -550,11 +556,12 @@ function buildTermFormulaV2(term, titleColNum, abstractColNum, guardPhrases) {
          '))))';
 }
 
-// Tri-state Filter Match formula: positive groups gate first (FALSE if any
-// fails), then exclude-mode NOT groups (FALSE if any trips), then
-// review-mode NOT groups (REVIEW if any trips), else TRUE — the exact same
-// rule order as jsMatchesFilterV2.
-function buildFilterMatchFormulaV2(parsedGroups, firstDetailColNum) {
+// Shared building blocks for both the Filter Match and Review-flag MAP
+// formulas — same params/ranges/positive/exclude/review expressions, just
+// wired into two different final booleans below. Kept as one function so
+// the two formulas (and jsMatchesFilterV2's own rule order) can't drift out
+// of sync with each other.
+function buildFilterExprPartsV2(parsedGroups, firstDetailColNum) {
   const totalTerms = parsedGroups.reduce(function(s, g) { return s + g.terms.length; }, 0);
   if (totalTerms === 0) return null;
 
@@ -599,11 +606,37 @@ function buildFilterMatchFormulaV2(parsedGroups, firstDetailColNum) {
     ? 'FALSE'
     : (reviewIdx.length === 1 ? orExprFor(reviewIdx[0]) : ('OR(' + reviewIdx.map(orExprFor).join(',') + ')'));
 
-  const stateExpr =
-    'IF(NOT(' + positiveExpr + '),"FALSE",IF(' + excludeExpr + ',"FALSE",IF(' + reviewExpr + ',"REVIEW","TRUE")))';
+  return { ranges: ranges, allParams: allParams, positiveExpr: positiveExpr, excludeExpr: excludeExpr, reviewExpr: reviewExpr };
+}
 
-  return '=MAP(A2:A,' + ranges + ',LAMBDA(' + allParams + ',' +
+// Pure boolean (split from the old tri-state text column into two orthogonal
+// booleans — Filter Match + Review, see buildReviewFlagFormulaV2 below):
+// TRUE iff every positive group matched AND no exclude-mode NOT group
+// tripped. A review-mode NOT group hit does NOT affect this column any
+// more — that's entirely the Review column's job now. This is exactly
+// jsMatchesFilterV2's `isMatch` — "in scope", independent of whether it
+// also needs human triage — so an external check can read this column
+// alone for a definitive in/out-of-scope yes/no.
+function buildFilterMatchFormulaV2(parsedGroups, firstDetailColNum) {
+  const parts = buildFilterExprPartsV2(parsedGroups, firstDetailColNum);
+  if (!parts) return null;
+  const stateExpr = 'IF(NOT(' + parts.positiveExpr + '),FALSE,IF(' + parts.excludeExpr + ',FALSE,TRUE))';
+  return '=MAP(A2:A,' + parts.ranges + ',LAMBDA(' + parts.allParams + ',' +
          'IF(ROW(a)=2,"Filter Match",' +
+         'IF(a="","",' + stateExpr + '))))';
+}
+
+// Pure boolean, orthogonal to Filter Match: TRUE iff the paper is in scope
+// (Filter Match=TRUE) AND a review-mode NOT group also tripped — mirrors
+// jsMatchesFilterV2's `state === 'REVIEW'`. FALSE whenever Filter Match is
+// FALSE too (a hard-excluded paper's review status is moot), so this column
+// is never TRUE on its own without Filter Match also being TRUE.
+function buildReviewFlagFormulaV2(parsedGroups, firstDetailColNum) {
+  const parts = buildFilterExprPartsV2(parsedGroups, firstDetailColNum);
+  if (!parts) return null;
+  const stateExpr = 'IF(NOT(' + parts.positiveExpr + '),FALSE,IF(' + parts.excludeExpr + ',FALSE,' + parts.reviewExpr + '))';
+  return '=MAP(A2:A,' + parts.ranges + ',LAMBDA(' + parts.allParams + ',' +
+         'IF(ROW(a)=2,"Review",' +
          'IF(a="","",' + stateExpr + '))))';
 }
 
@@ -689,33 +722,37 @@ function applyCrawlV2Highlight(sheet, groups, guardPhrases) {
       .setBackground('#FFFFFF').setFontColor('#FFFFFF')
       .setRanges([termDataRange]).build();
 
-    // Row highlight now reads K's own tri-state text directly — no
-    // separate NOT-hit formula needed, since K itself already distinguishes
-    // TRUE/FALSE/REVIEW.
+    // Row highlight now reads K (Filter Match) and L (Review) — both pure
+    // booleans — directly: green when in scope and clean, orange when in
+    // scope but flagged for review. A hard-excluded row (K=FALSE) gets
+    // neither, regardless of L (which the formula itself keeps FALSE
+    // whenever K is FALSE, but the row rule checks both explicitly anyway
+    // for clarity/defensiveness).
     var kLetter      = CRAWL_FILTER_MATCH_COL_LETTER; // "K" — from crawl.js
+    var lLetter      = CRAWL_REVIEW_FLAG_COL_LETTER;  // "L" — from crawl.js
     var fullRowRange = sheet.getRange(3, 1, sheet.getMaxRows() - 2, CRAWL_NUM_COLS);
     var trueRowRule = SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied('=$' + kLetter + '3="TRUE"')
+      .whenFormulaSatisfied('=AND($' + kLetter + '3=TRUE,$' + lLetter + '3=FALSE)')
       .setBackground('#b7e1cd') // green
       .setRanges([fullRowRange]).build();
     var reviewRowRule = SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied('=$' + kLetter + '3="REVIEW"')
+      .whenFormulaSatisfied('=AND($' + kLetter + '3=TRUE,$' + lLetter + '3=TRUE)')
       .setBackground('#ffe0b2') // orange
       .setRanges([fullRowRange]).build();
 
     // Drop anything touching the term-helper columns (stale per-term rules
     // from a previous Apply Highlight Rule click) or any prior row-
-    // highlight rule keyed on K (both the old boolean =$K3=TRUE form and
-    // the old score-demotion =AND($K3=TRUE,...) form, if this sheet was
-    // created before the tri-state change) — keep everything else
-    // (notably the no-abstract yellow-tint rule).
+    // highlight rule keyed on K or L (including the old tri-state text
+    // forms ="TRUE"/="REVIEW", if this sheet predates the Match/Review
+    // split) — keep everything else (notably the no-abstract yellow-tint
+    // rule).
     var existingRules = sheet.getConditionalFormatRules().filter(function(rule) {
       if (rule.getRanges().some(function(r) { return r.getColumn() >= CRAWL_FIRST_DETAIL; })) return false;
       var bc = rule.getBooleanCondition();
       if (bc) {
         var vals    = bc.getCriteriaValues();
         var formula = vals && vals[0];
-        if (formula && formula.indexOf('$' + kLetter + '3') !== -1) return false;
+        if (formula && (formula.indexOf('$' + kLetter + '3') !== -1 || formula.indexOf('$' + lLetter + '3') !== -1)) return false;
       }
       return true;
     });
@@ -723,15 +760,21 @@ function applyCrawlV2Highlight(sheet, groups, guardPhrases) {
   }
 
   var filterFormula = buildFilterMatchFormulaV2(parsed, CRAWL_FIRST_DETAIL);
-  if (!filterFormula) return;
+  var reviewFormula  = buildReviewFlagFormulaV2(parsed, CRAWL_FIRST_DETAIL);
+  if (!filterFormula || !reviewFormula) return;
   sheet.getRange(2, CRAWL_COL.FILTER_MATCH)
     .setFormula(filterFormula)
     .setFontWeight('bold')
     .setBackground('#4285f4')
     .setFontColor('white');
+  sheet.getRange(2, CRAWL_COL.REVIEW_FLAG)
+    .setFormula(reviewFormula)
+    .setFontWeight('bold')
+    .setBackground('#4285f4')
+    .setFontColor('white');
 }
 
-// Attaches a Flag Reason note to the Filter Match cell for a REVIEW row —
+// Attaches a Flag Reason note to the Review cell for a REVIEW row —
 // names the specific NOT group and term that triggered it, per §2 ("without
 // it the reviewer has to re-derive the decision"). A cell note rather than
 // a new "Flag Reason" column, consistent with this project's established
@@ -744,10 +787,10 @@ function applyFlagReasonNotes(sheet, startRow, flagInfos) {
     if (!info) continue;
     var groupLabel = 'NOT group ' + (info.flagGroupIndex + 1);
     var termLabel  = info.flagTerm ? (' (term: "' + info.flagTerm + '")') : '';
-    sheet.getRange(startRow + i, CRAWL_COL.FILTER_MATCH).setNote(
+    sheet.getRange(startRow + i, CRAWL_COL.REVIEW_FLAG).setNote(
       'Flagged for review: matches every positive filter group, but also ' +
       'tripped ' + groupLabel + termLabel + '. Kept and harvested, but not ' +
-      'expanded — REVIEW rows are terminal nodes pending human triage.'
+      'expanded — flagged rows are terminal nodes pending human triage.'
     );
   }
 }

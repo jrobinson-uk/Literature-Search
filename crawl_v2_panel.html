@@ -254,34 +254,13 @@
         </div>
 
         <p class="hint">
-          <strong>Phase 1 — Keyword pass.</strong> Target seed count via paginated Semantic
-          Scholar search (a relevance-sorted sweep and a date-sorted sweep, no year floor of its
-          own) — combines terms across your positive filter groups below automatically.
-        </p>
-        <div class="limits-row">
-          <div>
-            <label>Target seed count</label>
-            <input type="number" id="crawlTargetSeeds" value="200" min="10" max="1000">
-          </div>
-          <div>
-            <label>Pages per query</label>
-            <input type="number" id="phase1PagesPerQuery" value="3" min="1" max="10">
-          </div>
-        </div>
-        <div class="limits-row">
-          <div>
-            <label>Max queries (optional)</label>
-            <input type="number" id="phase1MaxQueries" placeholder="800 default">
-          </div>
-          <div>
-            <label>Shortfall tolerance (%)</label>
-            <input type="number" id="phase1ShortfallTolerance" value="50" min="1" max="100">
-          </div>
-        </div>
-        <p class="hint">
-          If the keyword pass collects fewer seeds than this percentage of the target, the crawl
-          stops with a "Shortfall" status instead of silently continuing to backward/forward with
-          a thin seed set — click "Resume v2 Crawl" to continue anyway once reviewed.
+          <strong>Phase 1 — Keyword pass.</strong> A single exhaustive, deterministic boolean
+          search against Semantic Scholar — combines every term across your positive filter groups
+          below into one query ((group 1 terms OR'd) (group 2 terms OR'd) (group 3 terms OR'd) …),
+          paged through completely rather than sampled (confirmed against the live API: implicit
+          space is AND-like, <code>|</code> is genuine OR). No target/page/query-count settings —
+          nothing left to tune. The Crawl Status cell reports the total candidate count found
+          before retrieving details, so you know how big the search is before it commits to it.
         </p>
 
         <div class="limits-row">
@@ -714,7 +693,6 @@
         var maxDepth      = parseInt(document.getElementById('crawlMaxDepth').value)  || 2;
         var backwardDepth = parseInt(document.getElementById('crawlBackwardDepth').value) || 1;
         var maxPapers     = parseInt(document.getElementById('crawlMaxPapers').value) || 300;
-        var targetSeeds   = parseInt(document.getElementById('crawlTargetSeeds').value) || 200;
         var groups        = getGroupsFromPanel();
         var guardPhrases  = parseCommaOrNewlineList(document.getElementById('guardPhrases').value);
         // "Log non-matches" checkboxes are framed positively (checked = record
@@ -731,10 +709,6 @@
         var phase0Venues   = parseCommaOrNewlineList(document.getElementById('phase0Venues').value);
         var phase0YearFrom = parseInt(document.getElementById('phase0YearFrom').value) || 2023;
         var phase0YearTo   = parseInt(document.getElementById('phase0YearTo').value)   || 2026;
-        var phase1PagesPerQuery      = parseInt(document.getElementById('phase1PagesPerQuery').value) || 3;
-        var phase1MaxQueriesRaw      = document.getElementById('phase1MaxQueries').value.trim();
-        var phase1MaxQueries         = phase1MaxQueriesRaw ? (parseInt(phase1MaxQueriesRaw) || 0) : 0;
-        var phase1ShortfallTolerance = (parseInt(document.getElementById('phase1ShortfallTolerance').value) || 50) / 100;
 
         if (!crawlName) { setStatus('Please enter a name for this crawl.'); return; }
         var hasPositiveGroup = groups.some(function(g) { return !g.not && g.terms; });
@@ -749,15 +723,13 @@
         google.script.run
           .withSuccessHandler(function(msg) { setStatus(msg); setLoading(false); })
           .withFailureHandler(function(err) { setStatus('Error: ' + err.message); setLoading(false); })
-          .startCrawlV2(seeds, maxDepth, maxPapers, targetSeeds, groups, crawlName,
+          .startCrawlV2(seeds, maxDepth, maxPapers, groups, crawlName,
                         { matchesOnlyVenue: matchesOnlyVenue, matchesOnlyKeyword: matchesOnlyKeyword,
                           matchesOnlyBackward: matchesOnlyBackward, matchesOnlyForward: matchesOnlyForward,
                           backwardMaxDepth: backwardDepth,
                           yearBound: yearBound, yearFrom: yearFrom, yearTo: yearTo,
                           guardPhrases: guardPhrases,
-                          phase0Venues: phase0Venues, phase0YearFrom: phase0YearFrom, phase0YearTo: phase0YearTo,
-                          phase1PagesPerQuery: phase1PagesPerQuery, phase1MaxQueries: phase1MaxQueries,
-                          phase1ShortfallTolerance: phase1ShortfallTolerance });
+                          phase0Venues: phase0Venues, phase0YearFrom: phase0YearFrom, phase0YearTo: phase0YearTo });
       }
 
       function resumeCrawl() {

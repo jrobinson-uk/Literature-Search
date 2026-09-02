@@ -1093,16 +1093,36 @@ function buildKeywordBooleanQuery(groups) {
 // own first page regardless); purely visibility.
 //
 // opts:
-//   noYearFloor:  ignore yearBound entirely for this phase's own
-//                 candidates (backward/forward keep it regardless) —
-//                 still defaults true, same as before.
+//   noYearFloor:  force-ignore yearBound for this phase's own candidates
+//                 even if the crawl has it configured (backward/forward
+//                 keep it regardless) — opt-IN now (default false), a
+//                 reversal from the old sampling-era default. When
+//                 sampling combos, applying a year floor further narrowed
+//                 an already-unreliable search; with exhaustive retrieval
+//                 there's no such downside, so the year bound the user
+//                 configured now applies here too by default — confirmed
+//                 against the live API that S2 bulk-search's own `year`
+//                 param genuinely narrows the server-side result set
+//                 (not just a client-side post-filter), so bounding it
+//                 also means fewer pages to page through, not just fewer
+//                 kept rows.
 //   matchesOnly:  record only genuine matches (default) vs. also record
 //                 FALSE candidates for audit (per-phase toggle, unchanged).
 function runKeywordPass(sheet, groups, guardPhrases, maxPapers, yearFloor, yearCeiling, yearBound, opts) {
   opts = opts || {};
-  var noYearFloor = opts.noYearFloor !== false;
+  var noYearFloor = opts.noYearFloor === true;
   var matchesOnly = opts.matchesOnly !== false;
   var effectiveYearBound = noYearFloor ? false : yearBound;
+  // S2's own year filter is applied server-side whenever the crawl has a
+  // year bound configured — same "YYYY-YYYY" format venue sweep already
+  // uses, open-ended on either side confirmed to work (e.g. "2023-" or
+  // "-2020"). yearCeiling falls back to the current year, mirroring
+  // isYearInBounds's own ceiling default so server-side and the client-
+  // side safety-net check below can never disagree about what "in bounds"
+  // means.
+  var yearRangeStr = effectiveYearBound
+    ? ((yearFloor || '') + '-' + (yearCeiling || new Date().getFullYear()))
+    : null;
 
   var props = PropertiesService.getScriptProperties();
   var query = buildKeywordBooleanQuery(groups);
@@ -1124,7 +1144,7 @@ function runKeywordPass(sheet, groups, guardPhrases, maxPapers, yearFloor, yearC
   // real retrieval needed anyway.
   var pendingFirstPage = null;
   if (totalStored == null) {
-    var preview = s2BulkSearch({ query: query });
+    var preview = s2BulkSearch({ query: query, year: yearRangeStr });
     total = preview.total || 0;
     props.setProperty('CRAWL2_KEYWORD_TOTAL', String(total));
     setCrawlStatus(sheet, 'Keyword pass — ' + total + ' candidate(s) found across the configured term groups, retrieving details…');
@@ -1155,7 +1175,7 @@ function runKeywordPass(sheet, groups, guardPhrases, maxPapers, yearFloor, yearC
       pageResult = pendingFirstPage;
       pendingFirstPage = null;
     } else {
-      pageResult = s2BulkSearch({ query: query, token: token || null });
+      pageResult = s2BulkSearch({ query: query, year: yearRangeStr, token: token || null });
       Utilities.sleep(1100); // same S2 pacing used elsewhere in the project
     }
     pagesFetched++;
@@ -1613,8 +1633,9 @@ function crawlV2BatchTrigger() {
     var phase0YearTo   = parseInt(props.getProperty('CRAWL2_PHASE0_YEAR_TO')   || String(PHASE0_YEAR_TO_DEFAULT));
     var keywordOpts = {
       matchesOnly: matchesOnlyKeyword
-      // noYearFloor deliberately omitted — runKeywordPass defaults it to
-      // true (the standard behaviour), not an opt-in flag.
+      // noYearFloor deliberately omitted — runKeywordPass now respects
+      // the crawl's own yearBound/yearFloor/yearCeiling by default (opt
+      // IN to ignore it via noYearFloor:true, not opt out).
     };
 
     var result;

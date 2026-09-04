@@ -232,6 +232,19 @@
         <p class="hint">Name this crawl — it becomes the sheet tab name.</p>
         <input type="text" id="crawlName" placeholder="e.g. K12 Physical Computing 2024">
 
+        <div class="check-row" style="align-items:flex-start;margin:10px 0;padding:8px;border:1px solid #ddd;border-radius:4px;background:#f9f9f9;">
+          <span style="min-width:150px;font-weight:600;">Pipeline phases to run</span>
+          <span style="font-size:0.85em;opacity:0.85;">
+            Keyword pass always runs — it's the core search. The others are optional, e.g. to test
+            keyword pass alone (year-bounded, exhaustive) before deciding whether citation-chasing
+            adds anything. Unchecking Backward or Forward also skips the second backward pass,
+            since that exists specifically to cover what Forward finds.
+            <label style="margin-right:12px;"><input type="checkbox" id="runVenuePhase" checked> Venue sweep</label>
+            <label style="margin-right:12px;"><input type="checkbox" id="runBackwardPhase" checked> Backward pass</label>
+            <label><input type="checkbox" id="runForwardPhase" checked> Forward pass</label>
+          </span>
+        </div>
+
         <p class="hint">
           <strong>Phase 0 — Venue sweep.</strong> Enumerates the full publication record of these
           venues (comma or newline separated — matched fuzzily against Semantic Scholar's own
@@ -693,6 +706,9 @@
         var maxDepth      = parseInt(document.getElementById('crawlMaxDepth').value)  || 2;
         var backwardDepth = parseInt(document.getElementById('crawlBackwardDepth').value) || 1;
         var maxPapers     = parseInt(document.getElementById('crawlMaxPapers').value) || 300;
+        var runVenuePhase    = document.getElementById('runVenuePhase').checked;
+        var runBackwardPhase = document.getElementById('runBackwardPhase').checked;
+        var runForwardPhase  = document.getElementById('runForwardPhase').checked;
         var groups        = getGroupsFromPanel();
         var guardPhrases  = parseCommaOrNewlineList(document.getElementById('guardPhrases').value);
         // "Log non-matches" checkboxes are framed positively (checked = record
@@ -727,6 +743,7 @@
                         { matchesOnlyVenue: matchesOnlyVenue, matchesOnlyKeyword: matchesOnlyKeyword,
                           matchesOnlyBackward: matchesOnlyBackward, matchesOnlyForward: matchesOnlyForward,
                           backwardMaxDepth: backwardDepth,
+                          runVenuePhase: runVenuePhase, runBackwardPhase: runBackwardPhase, runForwardPhase: runForwardPhase,
                           yearBound: yearBound, yearFrom: yearFrom, yearTo: yearTo,
                           guardPhrases: guardPhrases,
                           phase0Venues: phase0Venues, phase0YearFrom: phase0YearFrom, phase0YearTo: phase0YearTo });

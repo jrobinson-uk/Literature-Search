@@ -1628,6 +1628,31 @@ function crawlV2BatchTrigger() {
     var yearBound   = props.getProperty('CRAWL2_YEAR_BOUND') !== 'false';
     var logRow      = parseInt(props.getProperty('CRAWL2_LOG_ROW') || '0') || 0;
 
+    // Per-phase on/off toggles — default true (today's full pipeline) for
+    // crawls started before these existed. 'backward'/'forward'/'backward2'
+    // are only ever entered via a transition below that already checked the
+    // relevant flag, so those phase blocks themselves don't need to
+    // re-check — only 'venue' (always the hardcoded starting phase) and the
+    // transition logic (nextPhaseAfter) need to know about these.
+    var runVenuePhase    = props.getProperty('CRAWL2_RUN_VENUE_PHASE')    !== 'false';
+    var runBackwardPhase = props.getProperty('CRAWL2_RUN_BACKWARD_PHASE') !== 'false';
+    var runForwardPhase  = props.getProperty('CRAWL2_RUN_FORWARD_PHASE')  !== 'false';
+
+    // Returns the next phase to run after `current` completes, skipping any
+    // disabled ones — lets a keyword-only (or keyword + one direction) run
+    // work without restructuring the underlying venue -> keyword ->
+    // backward -> forward -> backward2 -> sweep sequence itself. Backward2
+    // is skipped whenever backward pass 1 was skipped too — it exists
+    // specifically to cover what forward finds on top of backward's own
+    // sources, so it's redundant with pass 1 if that never ran.
+    function nextPhaseAfter(current) {
+      if (current === 'venue')     return 'keyword';
+      if (current === 'keyword')   return runBackwardPhase ? 'backward' : (runForwardPhase ? 'forward' : 'sweep');
+      if (current === 'backward')  return runForwardPhase ? 'forward' : 'sweep';
+      if (current === 'forward')   return runBackwardPhase ? 'backward2' : 'sweep';
+      return 'sweep';
+    }
+
     var phase0Venues   = JSON.parse(props.getProperty('CRAWL2_PHASE0_VENUES') || '[]');
     var phase0YearFrom = parseInt(props.getProperty('CRAWL2_PHASE0_YEAR_FROM') || String(PHASE0_YEAR_FROM_DEFAULT));
     var phase0YearTo   = parseInt(props.getProperty('CRAWL2_PHASE0_YEAR_TO')   || String(PHASE0_YEAR_TO_DEFAULT));
@@ -1641,19 +1666,26 @@ function crawlV2BatchTrigger() {
     var result;
 
     if (phase === 'venue') {
-      setCrawlStatus(sheet, 'Venue sweep — batch ' + batch + '…');
-      result = runVenueSweep(sheet, groups, guardPhrases, phase0Venues, phase0YearFrom, phase0YearTo, maxPapers, matchesOnlyVenue);
-      if (result.status === 'time-limit') {
-        props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
-        setCrawlStatus(sheet, result.message);
-      } else {
-        // 'complete' covers both a genuinely finished sweep and the
-        // paper-limit-reached case (runVenueSweep returns 'complete' for
-        // both now — nothing more for this phase to do once the cap is
-        // hit, same as a normal finish) — either way, move on to keyword.
-        props.setProperty('CRAWL2_PHASE', 'keyword');
+      if (!runVenuePhase) {
+        var nextP = nextPhaseAfter('venue');
+        props.setProperty('CRAWL2_PHASE', nextP);
         props.setProperty('CRAWL2_BATCH_NUM', '1');
-        setCrawlStatus(sheet, result.message + ' — starting keyword pass…');
+        setCrawlStatus(sheet, 'Venue sweep disabled — starting keyword pass…');
+      } else {
+        setCrawlStatus(sheet, 'Venue sweep — batch ' + batch + '…');
+        result = runVenueSweep(sheet, groups, guardPhrases, phase0Venues, phase0YearFrom, phase0YearTo, maxPapers, matchesOnlyVenue);
+        if (result.status === 'time-limit') {
+          props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
+          setCrawlStatus(sheet, result.message);
+        } else {
+          // 'complete' covers both a genuinely finished sweep and the
+          // paper-limit-reached case (runVenueSweep returns 'complete' for
+          // both now — nothing more for this phase to do once the cap is
+          // hit, same as a normal finish) — either way, move on to keyword.
+          props.setProperty('CRAWL2_PHASE', 'keyword');
+          props.setProperty('CRAWL2_BATCH_NUM', '1');
+          setCrawlStatus(sheet, result.message + ' — starting keyword pass…');
+        }
       }
 
     } else if (phase === 'keyword') {
@@ -1665,10 +1697,12 @@ function crawlV2BatchTrigger() {
       } else {
         // 'complete' covers both a genuine finish and the paper-limit-
         // reached case (runKeywordPass returns 'complete' for both now,
-        // same reasoning as venue sweep) — either way, move on to backward.
-        props.setProperty('CRAWL2_PHASE', 'backward');
+        // same reasoning as venue sweep) — either way, move on to whatever
+        // phase is next enabled (backward/forward/sweep — see nextPhaseAfter).
+        var nextP = nextPhaseAfter('keyword');
+        props.setProperty('CRAWL2_PHASE', nextP);
         props.setProperty('CRAWL2_BATCH_NUM', '1');
-        setCrawlStatus(sheet, result.message + ' — starting backward pass…');
+        setCrawlStatus(sheet, result.message + ' — starting ' + nextP + ' phase…');
       }
 
     } else if (phase === 'backward') {
@@ -1678,9 +1712,10 @@ function crawlV2BatchTrigger() {
         props.setProperty('CRAWL2_BATCH_NUM', String(batch + 1));
         setCrawlStatus(sheet, result.message);
       } else {
-        props.setProperty('CRAWL2_PHASE', 'forward');
+        var nextP = nextPhaseAfter('backward');
+        props.setProperty('CRAWL2_PHASE', nextP);
         props.setProperty('CRAWL2_BATCH_NUM', '1');
-        setCrawlStatus(sheet, result.message + ' — starting forward pass…');
+        setCrawlStatus(sheet, result.message + ' — starting ' + nextP + ' phase…');
       }
 
     } else if (phase === 'forward') {
@@ -1692,11 +1727,11 @@ function crawlV2BatchTrigger() {
       } else {
         // 'complete' covers both a genuine finish and having hit maxPapers
         // partway through (runForwardPassV2 now drains the rest of the
-        // queue itself once the cap is reached, rather than stopping) —
-        // either way, move on to the second backward pass.
-        props.setProperty('CRAWL2_PHASE', 'backward2');
+        // queue itself once the cap is reached, rather than stopping).
+        var nextP = nextPhaseAfter('forward');
+        props.setProperty('CRAWL2_PHASE', nextP);
         props.setProperty('CRAWL2_BATCH_NUM', '1');
-        setCrawlStatus(sheet, result.message + ' — starting second backward pass (over the now-larger match set)…');
+        setCrawlStatus(sheet, result.message + ' — starting ' + nextP + ' phase…');
       }
 
     } else if (phase === 'backward2') {
@@ -1780,13 +1815,17 @@ function startCrawlV2(seeds, maxDepth, maxPapers, groups, crawlName, options) {
     // turns up still generates forward links to modern citing work.
     var backwardMaxDepth = parseInt(opts.backwardMaxDepth) || 1;
 
-    // v22 §0.1/§1: venue sweep and the backward dual-pass are the standard
-    // pipeline, not opt-in flags — no on/off toggles for either any more.
-    // Their own tunable parameters (venue list, year window) remain
-    // configurable. The keyword pass's own "tunable parameters" (query
-    // pagination, max queries, shortfall tolerance) no longer exist at all
-    // — it's now a single deterministic boolean query over the filter
-    // groups, paged exhaustively, with nothing left to tune.
+    // Per-phase on/off toggles — reintroduced (v22 had removed them,
+    // reasoning "the pipeline is the standard, not opt-in") specifically so
+    // a keyword-only, year-bounded run can be tested in isolation before
+    // deciding whether citation-chasing adds anything. Default true (today's
+    // pipeline, unchanged) if the panel doesn't send a value. Unchecking
+    // backward or forward also implies skipping the second backward pass —
+    // see crawlV2BatchTrigger's phase-transition logic — since that pass
+    // exists specifically to cover what forward finds.
+    var runVenuePhase    = opts.runVenuePhase    !== false;
+    var runBackwardPhase = opts.runBackwardPhase !== false;
+    var runForwardPhase  = opts.runForwardPhase  !== false;
     var phase0Venues   = Array.isArray(opts.phase0Venues) ? opts.phase0Venues : [];
     var phase0YearFrom = parseInt(opts.phase0YearFrom) || PHASE0_YEAR_FROM_DEFAULT;
     var phase0YearTo   = parseInt(opts.phase0YearTo)   || PHASE0_YEAR_TO_DEFAULT;
@@ -1825,10 +1864,15 @@ function startCrawlV2(seeds, maxDepth, maxPapers, groups, crawlName, options) {
     props.setProperty('CRAWL2_MAX_PAPERS',      String(maxPapers || 300));
     props.setProperty('CRAWL2_FILTER_GROUPS',   JSON.stringify(groups)); // v2's OWN key — not shared with v1/Snowball
     props.setProperty('CRAWL2_GUARD_PHRASES',   JSON.stringify(guardPhrases));
-    // Fixed phase sequence now (venue -> keyword -> backward -> forward ->
-    // backward2 -> sweep) — venue always starts first; it's a harmless
-    // no-op if no venues are configured.
+    // Phase sequence (venue -> keyword -> backward -> forward -> backward2
+    // -> sweep) always starts at 'venue' — crawlV2BatchTrigger's own
+    // per-phase handling skips straight past it (and past backward/
+    // forward/backward2) if disabled below, so this doesn't need to change
+    // based on which phases are enabled.
     props.setProperty('CRAWL2_PHASE',           'venue');
+    props.setProperty('CRAWL2_RUN_VENUE_PHASE',    runVenuePhase    ? 'true' : 'false');
+    props.setProperty('CRAWL2_RUN_BACKWARD_PHASE', runBackwardPhase ? 'true' : 'false');
+    props.setProperty('CRAWL2_RUN_FORWARD_PHASE',  runForwardPhase  ? 'true' : 'false');
     props.setProperty('CRAWL2_MATCHES_ONLY_VENUE',    matchesOnlyVenue    ? 'true' : 'false');
     props.setProperty('CRAWL2_MATCHES_ONLY_KEYWORD',  matchesOnlyKeyword  ? 'true' : 'false');
     props.setProperty('CRAWL2_MATCHES_ONLY_BACKWARD', matchesOnlyBackward ? 'true' : 'false');

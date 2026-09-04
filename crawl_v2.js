@@ -271,12 +271,13 @@ function debugCrawlV2Progress() {
   } else if (phase === 'forward') {
     lines.push('Papers still queued (Crawled=FALSE): ' + countUncrawled(sheet));
   } else if (phase === 'keyword') {
-    var kwTotal = props.getProperty('CRAWL2_KEYWORD_TOTAL');
+    var subQueries = buildKeywordSubQueries(groups);
+    var subQueryIdx = parseInt(props.getProperty('CRAWL2_KEYWORD_SUBQUERY_IDX') || '0');
+    lines.push('Sub-query: ' + (subQueryIdx + 1) + ' / ' + subQueries.length +
+      ' (split search — one query per term in the largest positive group)');
     lines.push('Matches collected: ' + (props.getProperty('CRAWL2_KEYWORD_COLLECTED') || '0'));
-    lines.push('Candidates examined: ' + (props.getProperty('CRAWL2_KEYWORD_RESULTS_SEEN') || '0') +
-      (kwTotal != null ? (' / ' + kwTotal) : ' (total not yet known — still on the preview call)'));
-    lines.push('Pages fetched: ' + (props.getProperty('CRAWL2_KEYWORD_PAGES_FETCHED') || '0') +
-      (kwTotal != null ? (' / ~' + Math.ceil(parseInt(kwTotal) / S2_BULK_PAGE_SIZE)) : ''));
+    lines.push('Candidates examined: ' + (props.getProperty('CRAWL2_KEYWORD_RESULTS_SEEN') || '0'));
+    lines.push('Pages fetched: ' + (props.getProperty('CRAWL2_KEYWORD_PAGES_FETCHED') || '0'));
   } else if (phase === 'venue') {
     lines.push('Seed papers collected so far: ' + (props.getProperty('CRAWL2_VENUE_COUNT') || '0'));
   } else if (phase === 'sweep') {
@@ -997,8 +998,8 @@ function runVenueSweep(sheet, groups, guardPhrases, venues, yearFrom, yearTo, ma
 //     record", not a topical search). It also supports real boolean syntax
 //     (confirmed empirically): implicit space between terms is AND-like
 //     (intersection), `|` is genuine OR (union), and parenthesized groups
-//     compose correctly — this is what Phase 1's single exhaustive query
-//     relies on (see buildKeywordBooleanQuery).
+//     compose correctly — this is what Phase 1's split sub-queries rely on
+//     (see buildKeywordSubQueries).
 //   - `venue` accepts a comma-separated list and fuzzy-matches each against
 //     canonical venue names (e.g. "SIGCSE" alone matched "Technical
 //     Symposium on Computer Science Education").
@@ -1056,60 +1057,82 @@ function parseGroupTermsV2(group) {
     .filter(function(t) { return t.length > 0; });
 }
 
-// Builds ONE deterministic boolean query covering the entire positive-
-// group term space: (group1 term | term | ...) (group2 term | ...) ...,
-// AND'd across groups by juxtaposition, OR'd within a group via `|`. NOT-
-// groups don't contribute (post-filtering only, same as everywhere else).
+// Formats one filter group's terms as a parenthesized OR-list — multi-word
+// or hyphenated terms get quoted so S2 treats them as a single phrase
+// rather than more AND'd words inside the OR list.
+function buildGroupExpr(terms) {
+  var alts = terms.map(function(t) {
+    return (/[\s-]/.test(t)) ? ('"' + t.replace(/"/g, '') + '"') : t;
+  });
+  return '(' + alts.join(' | ') + ')';
+}
+
+// Splits the exhaustive keyword search into one query per term in the
+// LAST positive group, each combined with the OTHER positive groups' full
+// OR-lists left unsplit — rather than one single query ANDing all positive
+// groups' full OR-lists together.
 //
-// Replaces the old cartesian-product-of-combos + random-sample approach
-// (buildKeywordQueries, removed) entirely. That approach generated up to a
-// few thousand single-term-per-group combo strings, shuffled them, and
-// only tried a capped random subset — meaning most of the combination
-// space was never searched, and which subset got tried was different
-// every run (worse: buildKeywordQueries was called fresh on every batch-
-// trigger firing during a multi-batch keyword pass, re-shuffling mid-run
-// too). Confirmed directly against the live API (not assumed) that S2's
-// bulk-search `query` field supports this syntax: implicit space is AND-
-// like (intersection — "novice learner" returns far fewer results than
-// either term alone), `|` is genuine boolean OR (union — "novice | learner"
-// returns ≈ the sum of both individually), and parenthesized groups compose
-// correctly (a compound 3-group test query was confirmed to surface a
-// known target paper). One query, paged exhaustively via the continuation
-// token, is both deterministic and a genuine superset of what the old
-// sampling approach could ever find.
-function buildKeywordBooleanQuery(groups) {
+// Why: confirmed live against the API (not assumed) that S2's bulk-search
+// backend is unreliable for one large compound query combining all three
+// groups' full term lists (50 OR'd terms total) — it intermittently
+// returns a bare "Internal Server Error" (not a rate limit), and worse,
+// sometimes returns a well-formed 200 response with token: null despite
+// `total` claiming many thousands more results, silently truncating the
+// search with no error to catch. The identical structure with the LAST
+// group's OR-list narrowed to a single term (confirmed: full Group 1 +
+// full Group 2 + one Group 3 term, e.g. "LLM") paginates reliably through
+// multiple pages with no such issue. Splitting on the last group
+// specifically — not "whichever group has the most terms" — matters: this
+// project's groups are conventionally population/modality/technology in
+// that order, and only the (full G1 + full G2 + single G3 term) shape has
+// actually been tested; an untested shape (e.g. single G1 term + full G2 +
+// full G3) could still hit the same unreliability this exists to avoid.
+//
+// This trades a real increase in total API volume (a paper matching several of
+// the split group's terms gets counted, and paged through, once per
+// matching term — the sum of sub-query totals is larger than the single
+// query's total) for actually being able to page through every sub-query
+// completely, rather than fast but silently incomplete.
+function buildKeywordSubQueries(groups) {
   var positiveTermLists = groups
     .filter(function(g) { return !g.not; })
     .map(parseGroupTermsV2)
     .filter(function(list) { return list.length > 0; });
 
-  if (positiveTermLists.length === 0) return null;
+  if (positiveTermLists.length === 0) return [];
+  if (positiveTermLists.length === 1) return [buildGroupExpr(positiveTermLists[0])];
 
-  var groupExprs = positiveTermLists.map(function(terms) {
-    var alts = terms.map(function(t) {
-      // Multi-word or hyphenated terms need quoting so S2 treats them as a
-      // single phrase rather than two more AND'd words inside the OR list.
-      return (/[\s-]/.test(t)) ? ('"' + t.replace(/"/g, '') + '"') : t;
-    });
-    return '(' + alts.join(' | ') + ')';
+  // Split on the LAST positive group specifically — not "whichever is
+  // largest" (a tie between two 18-term groups would pick the first one
+  // arbitrarily, and that's an untested combination). What's actually
+  // confirmed reliable is full Group 1 + full Group 2 + one Group 3 term —
+  // i.e. leaving the earlier (population/modality) groups fully OR'd and
+  // narrowing only the last (typically "technology/tool") group, which is
+  // usually the broadest, most generic-vocabulary axis anyway.
+  var splitIdx = positiveTermLists.length - 1;
+
+  var unsplitJoined = positiveTermLists
+    .filter(function(_, i) { return i !== splitIdx; })
+    .map(buildGroupExpr)
+    .join(' ');
+
+  return positiveTermLists[splitIdx].map(function(term) {
+    return unsplitJoined + ' ' + buildGroupExpr([term]);
   });
-  return groupExprs.join(' ');
 }
 
-// Exhaustive, deterministic keyword pass: builds the single boolean query
-// above and pages through EVERY result via S2 bulk-search's continuation
-// token, rather than sampling combos. No target/shortfall concept any
-// more — like venue sweep, it just runs to completion (or maxPapers);
-// "how many matches exist" isn't a sampling question once the search is
-// exhaustive. Resumable across trigger firings via CRAWL2_KEYWORD_TOKEN /
-// _TOTAL / _PAGES_FETCHED / _COLLECTED / _RESULTS_SEEN.
-//
-// The very first call of a crawl does a cheap preview (no token) purely to
-// read `total` and report it up front — "N candidates found, retrieving
-// details…" — before committing to the real page-by-page retrieval, per
-// the "so that I know ahead of time how big the search is likely to be"
-// ask. Not required for correctness (the main loop discovers this on its
-// own first page regardless); purely visibility.
+// Exhaustive, deterministic keyword pass: builds the split sub-queries
+// above and, for each in turn, pages through EVERY result via S2 bulk-
+// search's continuation token before moving to the next — rather than
+// sampling combos, and rather than one single compound query (see
+// buildKeywordSubQueries for why). No target/shortfall concept any more —
+// like venue sweep, it just runs to completion (or maxPapers); "how many
+// matches exist" isn't a sampling question once the search is exhaustive.
+// Resumable across trigger firings via CRAWL2_KEYWORD_SUBQUERY_IDX /
+// _TOKEN / _PAGES_FETCHED / _COLLECTED / _RESULTS_SEEN. Every page fetch's
+// own `total` field doubles as that sub-query's "N candidates found"
+// preview — no separate throwaway preview call needed, unlike the old
+// single-query version.
 //
 // opts:
 //   noYearFloor:  force-ignore yearBound for this phase's own candidates
@@ -1144,80 +1167,58 @@ function runKeywordPass(sheet, groups, guardPhrases, maxPapers, yearFloor, yearC
     : null;
 
   var props = PropertiesService.getScriptProperties();
-  var query = buildKeywordBooleanQuery(groups);
-  if (!query) {
+  var subQueries = buildKeywordSubQueries(groups);
+  if (subQueries.length === 0) {
     return { status: 'complete', message: 'Keyword pass complete — no positive filter groups to search on. Add at least one non-NOT filter group.' };
   }
 
+  var subQueryIdx  = parseInt(props.getProperty('CRAWL2_KEYWORD_SUBQUERY_IDX') || '0');
   var token        = props.getProperty('CRAWL2_KEYWORD_TOKEN') || null;
-  var totalStored  = props.getProperty('CRAWL2_KEYWORD_TOTAL');
   var pagesFetched = parseInt(props.getProperty('CRAWL2_KEYWORD_PAGES_FETCHED') || '0');
   var collected    = parseInt(props.getProperty('CRAWL2_KEYWORD_COLLECTED')     || '0');
   var resultsSeen  = parseInt(props.getProperty('CRAWL2_KEYWORD_RESULTS_SEEN')  || '0');
   var startTime = Date.now();
 
-  var total;
-  // If this is the crawl's first-ever call for this phase, the preview's
-  // own response IS page 1 — reused below rather than discarded and
-  // re-fetched, so the preview costs zero extra API calls beyond what the
-  // real retrieval needed anyway.
-  var pendingFirstPage = null;
-  if (totalStored == null) {
-    var preview = s2BulkSearch({ query: query, year: yearRangeStr });
-    if (preview.error) {
-      // Transient S2 failure even after s2Fetch's own retries — don't
-      // persist a bogus total (0 looks identical to "genuinely no
-      // candidates"), just ask the trigger to re-fire and retry the
-      // preview next time.
-      setCrawlStatus(sheet, 'Keyword pass — S2 returned a transient error while sizing the search; will retry…');
-      return { status: 'time-limit', message: 'Keyword pass — transient S2 error while sizing the search; retrying.' };
-    }
-    total = preview.total || 0;
-    props.setProperty('CRAWL2_KEYWORD_TOTAL', String(total));
-    setCrawlStatus(sheet, 'Keyword pass — ' + total + ' candidate(s) found across the configured term groups, retrieving details…');
-    pendingFirstPage = preview;
-  } else {
-    total = parseInt(totalStored);
-  }
-
   var existing = getCrawlV2ExistingKeys(sheet);
 
   function persistProgress() {
+    props.setProperty('CRAWL2_KEYWORD_SUBQUERY_IDX', String(subQueryIdx));
     props.setProperty('CRAWL2_KEYWORD_TOKEN', token || '');
     props.setProperty('CRAWL2_KEYWORD_PAGES_FETCHED', String(pagesFetched));
     props.setProperty('CRAWL2_KEYWORD_COLLECTED', String(collected));
     props.setProperty('CRAWL2_KEYWORD_RESULTS_SEEN', String(resultsSeen));
   }
 
-  while (true) {
+  while (subQueryIdx < subQueries.length) {
     if (Date.now() - startTime > CRAWL2_TIME_LIMIT_MS) {
       persistProgress();
-      return { status: 'time-limit', message: 'Keyword pass — time limit reached. Page ' + pagesFetched +
-             ' of ~' + Math.ceil(total / S2_BULK_PAGE_SIZE) + ', ' + collected + ' match(es) collected so far (' +
-             resultsSeen + '/' + total + ' candidates examined).' };
+      return { status: 'time-limit', message: 'Keyword pass — time limit reached. Sub-query ' + (subQueryIdx + 1) +
+             '/' + subQueries.length + ', ' + pagesFetched + ' page(s) fetched so far, ' + collected +
+             ' match(es) collected (' + resultsSeen + ' candidates examined).' };
     }
 
-    var pageResult;
-    if (pendingFirstPage) {
-      pageResult = pendingFirstPage;
-      pendingFirstPage = null;
-    } else {
-      pageResult = s2BulkSearch({ query: query, year: yearRangeStr, token: token || null });
-      Utilities.sleep(1100); // same S2 pacing used elsewhere in the project
-    }
+    var query = subQueries[subQueryIdx];
+    var pageResult = s2BulkSearch({ query: query, year: yearRangeStr, token: token || null });
 
     if (pageResult.error) {
-      // Transient S2 failure even after s2Fetch's own retries — don't
-      // advance pagesFetched/resultsSeen or the token (persistProgress
-      // below writes back the SAME token this call used), and don't fall
-      // through to the token-based completion check: pageResult.token
-      // equals the input token here (possibly null), which would
-      // otherwise look identical to "genuinely exhausted" and stop the
-      // phase early — exactly the bug this fixes. Ask the trigger to
-      // re-fire and retry this same page next time instead.
+      // Transient S2 failure even after s2Fetch's own retries — persist
+      // unchanged (token echoes back the input token, so this exact page
+      // of this exact sub-query gets retried) and ask the trigger to
+      // re-fire, rather than falling through to the token-based
+      // completion check below (which would otherwise treat the echoed-
+      // back token identically to "this sub-query is exhausted").
       persistProgress();
-      return { status: 'time-limit', message: 'Keyword pass — transient S2 error on page ' + (pagesFetched + 1) +
-             '; will retry. ' + collected + ' match(es) collected so far (' + resultsSeen + '/' + total + ' candidates examined).' };
+      return { status: 'time-limit', message: 'Keyword pass — transient S2 error on sub-query ' + (subQueryIdx + 1) +
+             '/' + subQueries.length + '; will retry. ' + collected + ' match(es) collected so far (' +
+             resultsSeen + ' candidates examined).' };
+    }
+    Utilities.sleep(1100); // same S2 pacing used elsewhere in the project
+
+    if (token == null) {
+      // First page of this sub-query — its own `total` field doubles as
+      // the "N candidates found" preview, no separate call needed.
+      setCrawlStatus(sheet, 'Keyword pass — sub-query ' + (subQueryIdx + 1) + '/' + subQueries.length +
+        ' (' + (pageResult.total || 0) + ' candidate(s)), retrieving details…');
     }
 
     pagesFetched++;
@@ -1271,18 +1272,23 @@ function runKeywordPass(sheet, groups, guardPhrases, maxPapers, yearFloor, yearC
         // finish now rather than keep paging just to throw results away.
         persistProgress();
         return { status: 'complete', message: 'Paper limit (' + maxPapers + ') reached during keyword pass — ' +
-               collected + ' match(es) collected before the cap (' + resultsSeen + '/' + total +
+               collected + ' match(es) collected before the cap (' + resultsSeen +
                ' candidates examined); moving on without adding more.' };
       }
     }
 
     token = pageResult.token;
-    if (!token) break; // exhausted — every page retrieved
+    if (!token) {
+      // This sub-query exhausted — advance to the next one, if any.
+      subQueryIdx++;
+      token = null;
+    }
   }
 
   persistProgress();
   return { status: 'complete', message: 'Keyword pass complete. ' + collected + ' match(es) collected from ' +
-         pagesFetched + ' page' + (pagesFetched === 1 ? '' : 's') + ' (' + resultsSeen + '/' + total + ' candidates examined).' };
+         pagesFetched + ' page' + (pagesFetched === 1 ? '' : 's') + ' across ' + subQueries.length + ' sub-quer' +
+         (subQueries.length === 1 ? 'y' : 'ies') + ' (' + resultsSeen + ' candidates examined).' };
 }
 
 // ============================================================
@@ -1922,8 +1928,8 @@ function startCrawlV2(seeds, maxDepth, maxPapers, groups, crawlName, options) {
     props.setProperty('CRAWL2_YEAR_BOUND',      yearBound   ? 'true' : 'false');
     props.setProperty('CRAWL2_YEAR_FLOOR',      String(yearFloor));
     props.setProperty('CRAWL2_YEAR_CEILING',    String(yearCeiling));
+    props.setProperty('CRAWL2_KEYWORD_SUBQUERY_IDX',  '0');
     props.setProperty('CRAWL2_KEYWORD_TOKEN',         '');
-    props.deleteProperty('CRAWL2_KEYWORD_TOTAL'); // re-derived by the preview call on first use this crawl
     props.setProperty('CRAWL2_KEYWORD_PAGES_FETCHED', '0');
     props.setProperty('CRAWL2_KEYWORD_COLLECTED',     '0');
     props.setProperty('CRAWL2_KEYWORD_RESULTS_SEEN',  '0');

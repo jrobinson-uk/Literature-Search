@@ -897,6 +897,19 @@ function runVenueSweep(sheet, groups, guardPhrases, venues, yearFrom, yearTo, ma
     var result = s2BulkSearch({ venue: batches[batchIdx], year: yearRange, token: token || null });
     Utilities.sleep(1100); // same S2 pacing used elsewhere in the project
 
+    if (result.error) {
+      // Transient S2 failure even after s2Fetch's own retries — result.token
+      // equals the input token here, which would otherwise look identical
+      // to "batch exhausted" below and silently skip to the next venue
+      // batch. Persist unchanged and ask the trigger to retry this same
+      // batch/page next time instead.
+      props.setProperty('CRAWL2_VENUE_BATCH_IDX', String(batchIdx));
+      props.setProperty('CRAWL2_VENUE_TOKEN', token);
+      props.setProperty('CRAWL2_VENUE_COUNT', String(collected));
+      return { status: 'time-limit', message: 'Venue sweep — transient S2 error on batch ' + (batchIdx + 1) +
+             '/' + batches.length + '; will retry. ' + collected + ' seed(s) collected so far.' };
+    }
+
     var newRows  = [];
     var newNotes = [];
     var newFlags = []; // aligned with newRows — flag info {flagGroupIndex, flagTerm} or null
@@ -1009,10 +1022,16 @@ function s2BulkSearch(opts) {
   if (opts.token)  params.push('token=' + encodeURIComponent(opts.token));
 
   var url  = 'https://api.semanticscholar.org/graph/v1/paper/search/bulk?' + params.join('&');
-  var resp = s2Fetch(url); // from crawl.js — handles 429 back-off
-  if (resp.getResponseCode() !== 200) return { total: 0, token: null, data: [] };
+  var resp = s2Fetch(url); // from crawl.js — handles 429/5xx back-off
+  // `error: true` marks a call that failed even after s2Fetch's own
+  // retries — distinct from a genuine empty/exhausted result (token: null,
+  // data: []) so callers can retry THIS SAME call later (e.g. via the
+  // existing time-limit-and-resume path) instead of concluding "done" from
+  // what's actually just a still-failing request. Preserves opts.token so
+  // a retry re-fetches the same page rather than silently skipping it.
+  if (resp.getResponseCode() !== 200) return { total: 0, token: opts.token || null, data: [], error: true };
   var data = JSON.parse(resp.getContentText());
-  if (data.error) return { total: 0, token: null, data: [] }; // e.g. an over-broad query with no venue/year filter
+  if (data.error) return { total: 0, token: opts.token || null, data: [], error: true }; // e.g. an over-broad query with no venue/year filter
   return { total: data.total || 0, token: data.token || null, data: data.data || [] };
 }
 
@@ -1145,6 +1164,14 @@ function runKeywordPass(sheet, groups, guardPhrases, maxPapers, yearFloor, yearC
   var pendingFirstPage = null;
   if (totalStored == null) {
     var preview = s2BulkSearch({ query: query, year: yearRangeStr });
+    if (preview.error) {
+      // Transient S2 failure even after s2Fetch's own retries — don't
+      // persist a bogus total (0 looks identical to "genuinely no
+      // candidates"), just ask the trigger to re-fire and retry the
+      // preview next time.
+      setCrawlStatus(sheet, 'Keyword pass — S2 returned a transient error while sizing the search; will retry…');
+      return { status: 'time-limit', message: 'Keyword pass — transient S2 error while sizing the search; retrying.' };
+    }
     total = preview.total || 0;
     props.setProperty('CRAWL2_KEYWORD_TOTAL', String(total));
     setCrawlStatus(sheet, 'Keyword pass — ' + total + ' candidate(s) found across the configured term groups, retrieving details…');
@@ -1178,6 +1205,21 @@ function runKeywordPass(sheet, groups, guardPhrases, maxPapers, yearFloor, yearC
       pageResult = s2BulkSearch({ query: query, year: yearRangeStr, token: token || null });
       Utilities.sleep(1100); // same S2 pacing used elsewhere in the project
     }
+
+    if (pageResult.error) {
+      // Transient S2 failure even after s2Fetch's own retries — don't
+      // advance pagesFetched/resultsSeen or the token (persistProgress
+      // below writes back the SAME token this call used), and don't fall
+      // through to the token-based completion check: pageResult.token
+      // equals the input token here (possibly null), which would
+      // otherwise look identical to "genuinely exhausted" and stop the
+      // phase early — exactly the bug this fixes. Ask the trigger to
+      // re-fire and retry this same page next time instead.
+      persistProgress();
+      return { status: 'time-limit', message: 'Keyword pass — transient S2 error on page ' + (pagesFetched + 1) +
+             '; will retry. ' + collected + ' match(es) collected so far (' + resultsSeen + '/' + total + ' candidates examined).' };
+    }
+
     pagesFetched++;
     resultsSeen += pageResult.data.length;
 

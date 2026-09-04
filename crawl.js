@@ -94,15 +94,24 @@ function getS2FetchOptions() {
   return opts;
 }
 
-// Fetches a Semantic Scholar URL, silently retrying on 429 with
-// exponential back-off (3 s → 10 s → 30 s).  Used for background
+// Fetches a Semantic Scholar URL, silently retrying with exponential
+// back-off (3 s → 10 s → 30 s) on 429 (rate limit) AND on 5xx (transient
+// server error) — confirmed live: complex bulk-search queries occasionally
+// return a bare "Internal Server Error" with no rate-limit signal at all,
+// and an identical retry moments later succeeds. Before this, only 429 was
+// retried, so a 500 looked identical to "not 200" to every caller —
+// several of which (s2BulkSearch in particular) treated any non-200
+// response as "genuinely zero results, nothing more to fetch", silently
+// truncating an exhaustive search partway through. Used for background
 // crawl-loop and seed-resolution calls.
 function s2Fetch(url) {
   var opts = getS2FetchOptions();
   var resp;
   for (var i = 0; i <= S2_BACKOFF_MS.length; i++) {
     resp = UrlFetchApp.fetch(url, opts);
-    if (resp.getResponseCode() !== 429 || i === S2_BACKOFF_MS.length) break;
+    var code = resp.getResponseCode();
+    var retryable = code === 429 || code >= 500;
+    if (!retryable || i === S2_BACKOFF_MS.length) break;
     Utilities.sleep(S2_BACKOFF_MS[i]);
   }
   return resp;

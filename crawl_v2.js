@@ -273,11 +273,21 @@ function debugCrawlV2Progress() {
   } else if (phase === 'keyword') {
     var subQueries = buildKeywordSubQueries(groups);
     var subQueryIdx = parseInt(props.getProperty('CRAWL2_KEYWORD_SUBQUERY_IDX') || '0');
-    lines.push('Sub-query: ' + (subQueryIdx + 1) + ' / ' + subQueries.length +
-      ' (split search — one query per term in the largest positive group)');
+    var currentTerm = subQueries[subQueryIdx] ? subQueries[subQueryIdx].term : '(none)';
+    lines.push('Sub-query: ' + (subQueryIdx + 1) + ' / ' + subQueries.length + ' — term: "' + currentTerm + '"');
     lines.push('Matches collected: ' + (props.getProperty('CRAWL2_KEYWORD_COLLECTED') || '0'));
     lines.push('Candidates examined: ' + (props.getProperty('CRAWL2_KEYWORD_RESULTS_SEEN') || '0'));
     lines.push('Pages fetched: ' + (props.getProperty('CRAWL2_KEYWORD_PAGES_FETCHED') || '0'));
+    var subQueryErrs = parseInt(props.getProperty('CRAWL2_KEYWORD_SUBQUERY_ERRORS') || '0');
+    var totalErrs    = parseInt(props.getProperty('CRAWL2_KEYWORD_TOTAL_ERRORS')    || '0');
+    if (subQueryErrs > 0) {
+      lines.push('⚠ Current sub-query has hit ' + subQueryErrs + ' transient S2 error(s) so far — retrying.');
+    }
+    lines.push('Total transient S2 errors this pass: ' + totalErrs);
+    var retriedTermsSoFar = JSON.parse(props.getProperty('CRAWL2_KEYWORD_RETRIED_TERMS') || '[]');
+    if (retriedTermsSoFar.length > 0) {
+      lines.push('Sub-queries that needed a retry so far: ' + retriedTermsSoFar.join(', '));
+    }
   } else if (phase === 'venue') {
     lines.push('Seed papers collected so far: ' + (props.getProperty('CRAWL2_VENUE_COUNT') || '0'));
   } else if (phase === 'sweep') {
@@ -1093,6 +1103,10 @@ function buildGroupExpr(terms) {
 // matching term — the sum of sub-query totals is larger than the single
 // query's total) for actually being able to page through every sub-query
 // completely, rather than fast but silently incomplete.
+// Returns [{ term, query }, ...] — term is kept alongside its compound
+// query string (not just the string alone) so status messages, error
+// logging, and Show Crawl Progress can all say WHICH term is currently
+// running/retrying, not just "sub-query 4/16".
 function buildKeywordSubQueries(groups) {
   var positiveTermLists = groups
     .filter(function(g) { return !g.not; })
@@ -1100,7 +1114,9 @@ function buildKeywordSubQueries(groups) {
     .filter(function(list) { return list.length > 0; });
 
   if (positiveTermLists.length === 0) return [];
-  if (positiveTermLists.length === 1) return [buildGroupExpr(positiveTermLists[0])];
+  if (positiveTermLists.length === 1) {
+    return [{ term: '(all Group 1 terms)', query: buildGroupExpr(positiveTermLists[0]) }];
+  }
 
   // Split on the LAST positive group specifically — not "whichever is
   // largest" (a tie between two 18-term groups would pick the first one
@@ -1117,7 +1133,7 @@ function buildKeywordSubQueries(groups) {
     .join(' ');
 
   return positiveTermLists[splitIdx].map(function(term) {
-    return unsplitJoined + ' ' + buildGroupExpr([term]);
+    return { term: term, query: unsplitJoined + ' ' + buildGroupExpr([term]) };
   });
 }
 
@@ -1177,6 +1193,15 @@ function runKeywordPass(sheet, groups, guardPhrases, maxPapers, yearFloor, yearC
   var pagesFetched = parseInt(props.getProperty('CRAWL2_KEYWORD_PAGES_FETCHED') || '0');
   var collected    = parseInt(props.getProperty('CRAWL2_KEYWORD_COLLECTED')     || '0');
   var resultsSeen  = parseInt(props.getProperty('CRAWL2_KEYWORD_RESULTS_SEEN')  || '0');
+  // Diagnostics for "which sub-query is actually flaky" — subQueryErrors
+  // resets to 0 whenever subQueryIdx advances (it's specific to whichever
+  // sub-query is currently running); totalErrors accumulates across the
+  // whole keyword pass; retriedTerms records each sub-query's term ONCE,
+  // the first time it hits an error, so the final summary can name exactly
+  // which terms needed a retry without needing to re-derive it later.
+  var subQueryErrors = parseInt(props.getProperty('CRAWL2_KEYWORD_SUBQUERY_ERRORS') || '0');
+  var totalErrors    = parseInt(props.getProperty('CRAWL2_KEYWORD_TOTAL_ERRORS')    || '0');
+  var retriedTerms   = JSON.parse(props.getProperty('CRAWL2_KEYWORD_RETRIED_TERMS') || '[]');
   var startTime = Date.now();
 
   var existing = getCrawlV2ExistingKeys(sheet);
@@ -1187,18 +1212,22 @@ function runKeywordPass(sheet, groups, guardPhrases, maxPapers, yearFloor, yearC
     props.setProperty('CRAWL2_KEYWORD_PAGES_FETCHED', String(pagesFetched));
     props.setProperty('CRAWL2_KEYWORD_COLLECTED', String(collected));
     props.setProperty('CRAWL2_KEYWORD_RESULTS_SEEN', String(resultsSeen));
+    props.setProperty('CRAWL2_KEYWORD_SUBQUERY_ERRORS', String(subQueryErrors));
+    props.setProperty('CRAWL2_KEYWORD_TOTAL_ERRORS', String(totalErrors));
+    props.setProperty('CRAWL2_KEYWORD_RETRIED_TERMS', JSON.stringify(retriedTerms));
   }
 
   while (subQueryIdx < subQueries.length) {
+    var currentTerm = subQueries[subQueryIdx].term;
+
     if (Date.now() - startTime > CRAWL2_TIME_LIMIT_MS) {
       persistProgress();
       return { status: 'time-limit', message: 'Keyword pass — time limit reached. Sub-query ' + (subQueryIdx + 1) +
-             '/' + subQueries.length + ', ' + pagesFetched + ' page(s) fetched so far, ' + collected +
-             ' match(es) collected (' + resultsSeen + ' candidates examined).' };
+             '/' + subQueries.length + ' ("' + currentTerm + '"), ' + pagesFetched + ' page(s) fetched so far, ' +
+             collected + ' match(es) collected (' + resultsSeen + ' candidates examined).' };
     }
 
-    var query = subQueries[subQueryIdx];
-    var pageResult = s2BulkSearch({ query: query, year: yearRangeStr, token: token || null });
+    var pageResult = s2BulkSearch({ query: subQueries[subQueryIdx].query, year: yearRangeStr, token: token || null });
 
     if (pageResult.error) {
       // Transient S2 failure even after s2Fetch's own retries — persist
@@ -1207,9 +1236,13 @@ function runKeywordPass(sheet, groups, guardPhrases, maxPapers, yearFloor, yearC
       // re-fire, rather than falling through to the token-based
       // completion check below (which would otherwise treat the echoed-
       // back token identically to "this sub-query is exhausted").
+      subQueryErrors++;
+      totalErrors++;
+      if (subQueryErrors === 1 && retriedTerms.indexOf(currentTerm) === -1) retriedTerms.push(currentTerm);
       persistProgress();
       return { status: 'time-limit', message: 'Keyword pass — transient S2 error on sub-query ' + (subQueryIdx + 1) +
-             '/' + subQueries.length + '; will retry. ' + collected + ' match(es) collected so far (' +
+             '/' + subQueries.length + ' ("' + currentTerm + '", attempt ' + subQueryErrors + ' on this sub-query, ' +
+             totalErrors + ' total this pass); will retry. ' + collected + ' match(es) collected so far (' +
              resultsSeen + ' candidates examined).' };
     }
     Utilities.sleep(1100); // same S2 pacing used elsewhere in the project
@@ -1218,7 +1251,7 @@ function runKeywordPass(sheet, groups, guardPhrases, maxPapers, yearFloor, yearC
       // First page of this sub-query — its own `total` field doubles as
       // the "N candidates found" preview, no separate call needed.
       setCrawlStatus(sheet, 'Keyword pass — sub-query ' + (subQueryIdx + 1) + '/' + subQueries.length +
-        ' (' + (pageResult.total || 0) + ' candidate(s)), retrieving details…');
+        ' ("' + currentTerm + '", ' + (pageResult.total || 0) + ' candidate(s)), retrieving details…');
     }
 
     pagesFetched++;
@@ -1279,16 +1312,26 @@ function runKeywordPass(sheet, groups, guardPhrases, maxPapers, yearFloor, yearC
 
     token = pageResult.token;
     if (!token) {
-      // This sub-query exhausted — advance to the next one, if any.
+      // This sub-query exhausted — advance to the next one, if any. Reset
+      // the per-sub-query error counter (it's specific to whichever
+      // sub-query is currently running); totalErrors/retriedTerms are
+      // cumulative for the whole pass and don't reset here.
       subQueryIdx++;
       token = null;
+      subQueryErrors = 0;
     }
   }
 
   persistProgress();
-  return { status: 'complete', message: 'Keyword pass complete. ' + collected + ' match(es) collected from ' +
-         pagesFetched + ' page' + (pagesFetched === 1 ? '' : 's') + ' across ' + subQueries.length + ' sub-quer' +
-         (subQueries.length === 1 ? 'y' : 'ies') + ' (' + resultsSeen + ' candidates examined).' };
+  var summary = 'Keyword pass complete. ' + collected + ' match(es) collected from ' +
+    pagesFetched + ' page' + (pagesFetched === 1 ? '' : 's') + ' across ' + subQueries.length + ' sub-quer' +
+    (subQueries.length === 1 ? 'y' : 'ies') + ' (' + resultsSeen + ' candidates examined).';
+  if (retriedTerms.length > 0) {
+    summary += ' ' + retriedTerms.length + ' sub-quer' + (retriedTerms.length === 1 ? 'y' : 'ies') +
+      ' needed at least one retry due to transient S2 errors (' + totalErrors + ' total): ' +
+      retriedTerms.join(', ') + '.';
+  }
+  return { status: 'complete', message: summary };
 }
 
 // ============================================================
@@ -1928,11 +1971,14 @@ function startCrawlV2(seeds, maxDepth, maxPapers, groups, crawlName, options) {
     props.setProperty('CRAWL2_YEAR_BOUND',      yearBound   ? 'true' : 'false');
     props.setProperty('CRAWL2_YEAR_FLOOR',      String(yearFloor));
     props.setProperty('CRAWL2_YEAR_CEILING',    String(yearCeiling));
-    props.setProperty('CRAWL2_KEYWORD_SUBQUERY_IDX',  '0');
-    props.setProperty('CRAWL2_KEYWORD_TOKEN',         '');
-    props.setProperty('CRAWL2_KEYWORD_PAGES_FETCHED', '0');
-    props.setProperty('CRAWL2_KEYWORD_COLLECTED',     '0');
-    props.setProperty('CRAWL2_KEYWORD_RESULTS_SEEN',  '0');
+    props.setProperty('CRAWL2_KEYWORD_SUBQUERY_IDX',    '0');
+    props.setProperty('CRAWL2_KEYWORD_TOKEN',           '');
+    props.setProperty('CRAWL2_KEYWORD_PAGES_FETCHED',   '0');
+    props.setProperty('CRAWL2_KEYWORD_COLLECTED',       '0');
+    props.setProperty('CRAWL2_KEYWORD_RESULTS_SEEN',    '0');
+    props.setProperty('CRAWL2_KEYWORD_SUBQUERY_ERRORS', '0');
+    props.setProperty('CRAWL2_KEYWORD_TOTAL_ERRORS',    '0');
+    props.setProperty('CRAWL2_KEYWORD_RETRIED_TERMS',   '[]');
     props.setProperty('CRAWL2_BACKWARD_IDX',      '0');
     props.setProperty('CRAWL2_BACKWARD_EXAMINED', '0');
     props.setProperty('CRAWL2_BACKWARD_KEPT',     '0');

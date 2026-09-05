@@ -22,6 +22,19 @@
 const CRAWL_HEADERS  = ["Depth","Crawled","Year","Title","Authors","Type","Venue","Abstract","ID","Cited By","Filter Match","Review","Found From","Matched Cites","Direction"];
 const CRAWL_NUM_COLS = CRAWL_HEADERS.length; // 15
 
+// Row layout: 1 = crawl status/meta, 2 = column headers (including each
+// term-helper column's own term name), 3 = per-column totals — currently
+// just a COUNTIF(TRUE) for each term-helper column (and Filter Match/
+// Review), giving an at-a-glance "how many rows matched this keyword"
+// figure right where you'd look for it, between the header and the first
+// paper — 4+ = real paper rows. Was header=2/data=3 before the totals row
+// was added; every fixed row reference below (and in crawl_v2.js) is keyed
+// off these constants rather than the literal 3/4, specifically so this
+// can't happen again silently if the layout ever needs another such row.
+const CRAWL_HEADER_ROW     = 2;
+const CRAWL_TOTALS_ROW     = 3;
+const CRAWL_FIRST_DATA_ROW = 4;
+
 const CRAWL_COL = {
   DEPTH:         1,
   CRAWLED:       2,
@@ -43,10 +56,14 @@ const CRAWL_COL = {
 // Col 16: In-Sheet Links — MAP formula; sits after Direction and before term helpers.
 // Counts how many papers in the sheet list this paper as their Found From parent (col M).
 const CRAWL_IN_SHEET_LINKS_COL = CRAWL_COL.DIRECTION + 1; // 16
+// Anchor stays at row 2 (no totals-row need here) — its own IF(a="",...)
+// branch already yields "" for row 3 (Depth is intentionally left blank
+// there), so it needs no anchor shift, just the counted range bumped to
+// start at the real first data row instead of the old row 3.
 const CRAWL_IN_SHEET_LINKS_FORMULA =
   '=MAP(A2:A,I2:I,LAMBDA(a,id,' +
   'IF(ROW(a)=2,"In-Sheet Links",' +
-  'IF(a="","",COUNTIF(M$3:M,id)))))';
+  'IF(a="","",COUNTIF(M$' + CRAWL_FIRST_DATA_ROW + ':M,id)))))';
 
 // Term-helper columns written by the highlight applier start here.
 const CRAWL_FIRST_DETAIL_COL = CRAWL_IN_SHEET_LINKS_COL + 1; // 17
@@ -187,7 +204,14 @@ function setupCrawlSheet(sheet, direction, seedTitle) {
     .setFormula(CRAWL_IN_SHEET_LINKS_FORMULA)
     .setFontWeight("bold").setBackground("#4285f4").setFontColor("white");
 
-  sheet.setFrozenRows(2);
+  // Row 3: totals — a label in col A plus a light band across the fixed
+  // columns; applyCrawlV2Highlight fills in the actual COUNTIF formulas for
+  // Filter Match, Review, and every term-helper column once a real filter
+  // exists. Frozen alongside rows 1-2 so it stays visible while scrolling.
+  sheet.getRange(CRAWL_TOTALS_ROW, 1).setValue("Totals")
+    .setFontWeight("bold").setFontColor("#555555").setFontSize(9);
+  sheet.getRange(CRAWL_TOTALS_ROW, 1, 1, CRAWL_NUM_COLS).setBackground("#f1f3f4");
+  sheet.setFrozenRows(CRAWL_TOTALS_ROW);
 
   // Column widths
   sheet.setColumnWidth(CRAWL_COL.DEPTH,     60);
@@ -212,21 +236,25 @@ function setupCrawlSheet(sheet, direction, seedTitle) {
   sheet.getRange(1, 1, maxRows, CRAWL_NUM_COLS).setWrap(true);
   sheet.getRange(1, CRAWL_COL.ABSTRACT, maxRows, 1)
     .setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
-  sheet.setRowHeights(3, maxRows - 2, CRAWL_ROW_HEIGHT);
-  sheet.getRange(3, CRAWL_COL.TITLE,    maxRows - 2, 1).setFontSize(10);
-  sheet.getRange(3, CRAWL_COL.AUTHORS,  maxRows - 2, 1).setFontSize(10);
-  sheet.getRange(3, CRAWL_COL.ABSTRACT, maxRows - 2, 1).setFontSize(8);
+  var dataRowCount = maxRows - CRAWL_FIRST_DATA_ROW + 1;
+  sheet.setRowHeights(CRAWL_FIRST_DATA_ROW, dataRowCount, CRAWL_ROW_HEIGHT);
+  sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.TITLE,    dataRowCount, 1).setFontSize(10);
+  sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.AUTHORS,  dataRowCount, 1).setFontSize(10);
+  sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.ABSTRACT, dataRowCount, 1).setFontSize(8);
 
-  // Filter
-  sheet.getRange(2, 1, maxRows - 1, CRAWL_NUM_COLS).createFilter();
+  // Filter — starts at the header row as usual; the totals row (3) sits
+  // inside this same range, so it's technically filterable/sortable too.
+  // Harmless in practice (it has no value in most columns to filter by,
+  // and re-showing it is one click on "Clear filter"), just worth knowing.
+  sheet.getRange(CRAWL_HEADER_ROW, 1, maxRows - 1, CRAWL_NUM_COLS).createFilter();
 
   // CF rule: highlight entire row green when Filter Match = TRUE.
   // (v2's applyCrawlV2Highlight replaces this with a green/orange pair the
   // first time "Apply Highlight Rule" runs — this is just the placeholder
   // that's correct before any real filter groups exist.)
-  var cfRange = sheet.getRange(3, 1, maxRows - 2, CRAWL_NUM_COLS);
+  var cfRange = sheet.getRange(CRAWL_FIRST_DATA_ROW, 1, dataRowCount, CRAWL_NUM_COLS);
   var cfRule  = SpreadsheetApp.newConditionalFormatRule()
-    .whenFormulaSatisfied("=$" + CRAWL_FILTER_MATCH_COL_LETTER + "3=TRUE")
+    .whenFormulaSatisfied("=$" + CRAWL_FILTER_MATCH_COL_LETTER + CRAWL_FIRST_DATA_ROW + "=TRUE")
     .setBackground("#b7e1cd")
     .setRanges([cfRange])
     .build();
@@ -237,9 +265,9 @@ function setupCrawlSheet(sheet, direction, seedTitle) {
   // only (no inserted text), so it can't itself be picked up by the term
   // search the way an inline marker in a searched column would be.
   var absLetter  = colToLetter(CRAWL_COL.ABSTRACT);
-  var absRange   = sheet.getRange(3, CRAWL_COL.ABSTRACT, maxRows - 2, 1);
+  var absRange   = sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.ABSTRACT, dataRowCount, 1);
   var noAbsRule  = SpreadsheetApp.newConditionalFormatRule()
-    .whenFormulaSatisfied("=$" + absLetter + "3=\"\"")
+    .whenFormulaSatisfied("=$" + absLetter + CRAWL_FIRST_DATA_ROW + "=\"\"")
     .setBackground("#fff3cd")
     .setRanges([absRange])
     .build();
@@ -255,12 +283,12 @@ function setupCrawlSheet(sheet, direction, seedTitle) {
 // any formula-spill inflation of getLastRow().
 function getCrawlLastDataRow(sheet) {
   const maxRows = sheet.getMaxRows();
-  if (maxRows < 3) return 2;
-  const vals = sheet.getRange(3, CRAWL_COL.DEPTH, maxRows - 2, 1).getValues().flat();
+  if (maxRows < CRAWL_FIRST_DATA_ROW) return CRAWL_TOTALS_ROW;
+  const vals = sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.DEPTH, maxRows - CRAWL_FIRST_DATA_ROW + 1, 1).getValues().flat();
   for (var i = vals.length - 1; i >= 0; i--) {
-    if (vals[i] !== "" && vals[i] !== null && vals[i] !== undefined) return i + 3;
+    if (vals[i] !== "" && vals[i] !== null && vals[i] !== undefined) return i + CRAWL_FIRST_DATA_ROW;
   }
-  return 2;
+  return CRAWL_TOTALS_ROW; // no data yet — sentinel is the row just above the first data row
 }
 
 // Returns the first row where Crawled = FALSE (skipping any row numbers in
@@ -271,10 +299,10 @@ function getCrawlLastDataRow(sheet) {
 // markFetchFailure / CRAWL_FETCH_FAILURE_MAX_RETRIES).
 function findNextUncrawled(sheet, skipRows) {
   const lastRow = getCrawlLastDataRow(sheet);
-  if (lastRow < 3) return null;
-  const data = sheet.getRange(3, 1, lastRow - 2, CRAWL_NUM_COLS).getValues();
+  if (lastRow < CRAWL_FIRST_DATA_ROW) return null;
+  const data = sheet.getRange(CRAWL_FIRST_DATA_ROW, 1, lastRow - CRAWL_FIRST_DATA_ROW + 1, CRAWL_NUM_COLS).getValues();
   for (var i = 0; i < data.length; i++) {
-    var sheetRow = i + 3;
+    var sheetRow = i + CRAWL_FIRST_DATA_ROW;
     if (skipRows && skipRows.has(sheetRow)) continue;
     if (data[i][CRAWL_COL.CRAWLED - 1] === false) {
       return {
@@ -290,8 +318,8 @@ function findNextUncrawled(sheet, skipRows) {
 
 function countUncrawled(sheet) {
   const lastRow = getCrawlLastDataRow(sheet);
-  if (lastRow < 3) return 0;
-  const vals = sheet.getRange(3, CRAWL_COL.CRAWLED, lastRow - 2, 1).getValues().flat();
+  if (lastRow < CRAWL_FIRST_DATA_ROW) return 0;
+  const vals = sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.CRAWLED, lastRow - CRAWL_FIRST_DATA_ROW + 1, 1).getValues().flat();
   return vals.filter(function(v) { return v === false; }).length;
 }
 
@@ -658,12 +686,12 @@ function s2GetReferences(paperSheetId) {
 // crawl session (time-limit, complete, or paper-cap) so the column stays current.
 function updateCrawlMatchedCites(sheet) {
   var lastRow = getCrawlLastDataRow(sheet);
-  if (lastRow < 3) return;
-  var numRows = lastRow - 2;
+  if (lastRow < CRAWL_FIRST_DATA_ROW) return;
+  var numRows = lastRow - CRAWL_FIRST_DATA_ROW + 1;
 
   // Read ID (col 9) and Found From (col 12) in one batch
-  var idCol = sheet.getRange(3, CRAWL_COL.ID,         numRows, 1).getValues();
-  var ffCol = sheet.getRange(3, CRAWL_COL.FOUND_FROM, numRows, 1).getValues();
+  var idCol = sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.ID,         numRows, 1).getValues();
+  var ffCol = sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.FOUND_FROM, numRows, 1).getValues();
 
   // Build reverse map: parentId → [child IDs]
   var parentToChildren = {};
@@ -683,6 +711,6 @@ function updateCrawlMatchedCites(sheet) {
     updates.push([children.join(", ")]);
   }
   if (updates.length > 0) {
-    sheet.getRange(3, CRAWL_COL.MATCHED_CITES, updates.length, 1).setValues(updates);
+    sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.MATCHED_CITES, updates.length, 1).setValues(updates);
   }
 }

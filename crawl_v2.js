@@ -246,8 +246,8 @@ function debugCrawlV2Progress() {
 
     var lastRow = getCrawlLastDataRow(sheet);
     var total = 0;
-    if (lastRow >= 3) {
-      var data = sheet.getRange(3, 1, lastRow - 2, CRAWL_NUM_COLS).getValues();
+    if (lastRow >= CRAWL_FIRST_DATA_ROW) {
+      var data = sheet.getRange(CRAWL_FIRST_DATA_ROW, 1, lastRow - CRAWL_FIRST_DATA_ROW + 1, CRAWL_NUM_COLS).getValues();
       data.forEach(function(row) {
         var id = String(row[CRAWL_COL.ID - 1] || '').trim();
         if (!id) return;
@@ -355,9 +355,10 @@ function getCrawlV2ExistingKeys(sheet) {
   var ids     = new Set();
   var titles  = new Set();
   var dois    = loadSeenDois();
-  if (lastRow < 3) return { ids: ids, titles: titles, dois: dois };
-  var idVals    = sheet.getRange(3, CRAWL_COL.ID,    lastRow - 2, 1).getValues().flat();
-  var titleVals = sheet.getRange(3, CRAWL_COL.TITLE, lastRow - 2, 1).getValues().flat();
+  if (lastRow < CRAWL_FIRST_DATA_ROW) return { ids: ids, titles: titles, dois: dois };
+  var numRows   = lastRow - CRAWL_FIRST_DATA_ROW + 1;
+  var idVals    = sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.ID,    numRows, 1).getValues().flat();
+  var titleVals = sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.TITLE, numRows, 1).getValues().flat();
   idVals.forEach(function(v) { if (v) ids.add(v); });
   titleVals.forEach(function(v) {
     var norm = normalizeTitleV2(v);
@@ -544,17 +545,36 @@ function escapeTermForSheetFormula(s) {
 // v2 variant of snowball.js's shared buildTermFormula, adding guardPhrases
 // masking — not edited in place in snowball.js since that function is
 // shared with the unrelated Snowball feature and v1.
+//
+// Anchored at CRAWL_FIRST_DATA_ROW rather than the header row — the header
+// row now holds a plain static term label (written directly by the caller)
+// and the row between that and this anchor holds a COUNTIF totals formula
+// (also written by the caller); this array formula owns only the real data
+// rows from CRAWL_FIRST_DATA_ROW down, so it can no longer double as its
+// own header the way it did pre-totals-row (that trick would collide with
+// the totals row now sitting in between).
 function buildTermFormulaV2(term, titleColNum, abstractColNum, guardPhrases) {
   const titleLetter  = colToLetter(titleColNum); // from snowball.js
   const absLetter    = colToLetter(abstractColNum);
-  const safeTerm     = term.replace(/"/g, '""');
   const innerPattern = buildPluralAwareTermPattern(term, escapeTermForSheetFormula); // from crawl.js
   const maskedExpr   = buildMaskedTextExprV2('LOWER(t&" "&k)', guardPhrases);
-  return '=MAP(A2:A,' + titleLetter + '2:' + titleLetter + ',' + absLetter + '2:' + absLetter + ',LAMBDA(a,t,k,' +
-         'IF(ROW(a)=2,"' + safeTerm + '",' +
+  const anchor = CRAWL_FIRST_DATA_ROW;
+  return '=MAP(A' + anchor + ':A,' + titleLetter + anchor + ':' + titleLetter + ',' +
+         absLetter + anchor + ':' + absLetter + ',LAMBDA(a,t,k,' +
          'IF(a="","",' +
          'REGEXMATCH(' + maskedExpr + ',"\\b' + innerPattern + '\\b")' +
-         '))))';
+         ')))';
+}
+
+// Sheet formula for the totals row (CRAWL_TOTALS_ROW): counts how many rows
+// in this column's own data range (CRAWL_FIRST_DATA_ROW downward) are TRUE
+// — a plain COUNTIF, deliberately NOT part of the array formula above (a
+// self-referential COUNTIF over a range the same array formula also
+// produces would be circular), so it lives in a genuinely separate cell one
+// row above that array's anchor.
+function buildColumnTotalFormula(colNum) {
+  const l = colToLetter(colNum); // from snowball.js
+  return '=COUNTIF(' + l + CRAWL_FIRST_DATA_ROW + ':' + l + ',TRUE)';
 }
 
 // Shared building blocks for both the Filter Match and Review-flag MAP
@@ -578,7 +598,10 @@ function buildFilterExprPartsV2(parsedGroups, firstDetailColNum) {
       const colNum = firstDetailColNum +
         parsedGroups.slice(0, gi).reduce(function(s, pg) { return s + pg.terms.length; }, 0) + ti;
       const l = colToLetter(colNum); // from snowball.js
-      return l + '2:' + l;
+      // Starts at CRAWL_FIRST_DATA_ROW, matching buildTermFormulaV2's own
+      // anchor — the term column's row 2 (static header text) and row 3
+      // (its own totals number) are never fed into this AND/OR reduction.
+      return l + CRAWL_FIRST_DATA_ROW + ':' + l;
     }).join(',');
   }).join(',');
 
@@ -622,9 +645,11 @@ function buildFilterMatchFormulaV2(parsedGroups, firstDetailColNum) {
   const parts = buildFilterExprPartsV2(parsedGroups, firstDetailColNum);
   if (!parts) return null;
   const stateExpr = 'IF(NOT(' + parts.positiveExpr + '),FALSE,IF(' + parts.excludeExpr + ',FALSE,TRUE))';
-  return '=MAP(A2:A,' + parts.ranges + ',LAMBDA(' + parts.allParams + ',' +
-         'IF(ROW(a)=2,"Filter Match",' +
-         'IF(a="","",' + stateExpr + '))))';
+  // Anchored at CRAWL_FIRST_DATA_ROW like the term columns it reads (see
+  // buildTermFormulaV2) — header text and the totals-row COUNTIF are written
+  // separately by the caller, same reasoning as there.
+  return '=MAP(A' + CRAWL_FIRST_DATA_ROW + ':A,' + parts.ranges + ',LAMBDA(' + parts.allParams + ',' +
+         'IF(a="","",' + stateExpr + ')))';
 }
 
 // Pure boolean, orthogonal to Filter Match: TRUE iff the paper is in scope
@@ -636,9 +661,8 @@ function buildReviewFlagFormulaV2(parsedGroups, firstDetailColNum) {
   const parts = buildFilterExprPartsV2(parsedGroups, firstDetailColNum);
   if (!parts) return null;
   const stateExpr = 'IF(NOT(' + parts.positiveExpr + '),FALSE,IF(' + parts.excludeExpr + ',FALSE,' + parts.reviewExpr + '))';
-  return '=MAP(A2:A,' + parts.ranges + ',LAMBDA(' + parts.allParams + ',' +
-         'IF(ROW(a)=2,"Review",' +
-         'IF(a="","",' + stateExpr + '))))';
+  return '=MAP(A' + CRAWL_FIRST_DATA_ROW + ':A,' + parts.ranges + ',LAMBDA(' + parts.allParams + ',' +
+         'IF(a="","",' + stateExpr + ')))';
 }
 
 // Replaces the shared applyCrawlHighlight (v1, archived) — identical term-
@@ -650,7 +674,7 @@ function buildReviewFlagFormulaV2(parsedGroups, firstDetailColNum) {
 function applyCrawlV2Highlight(sheet, groups, guardPhrases) {
   var CRAWL_FIRST_DETAIL = CRAWL_FIRST_DETAIL_COL;
 
-  sheet.getRange(2, CRAWL_IN_SHEET_LINKS_COL)
+  sheet.getRange(CRAWL_HEADER_ROW, CRAWL_IN_SHEET_LINKS_COL)
     .setFormula(CRAWL_IN_SHEET_LINKS_FORMULA)
     .setFontWeight('bold').setBackground('#4285f4').setFontColor('white');
   sheet.setColumnWidth(CRAWL_IN_SHEET_LINKS_COL, 90);
@@ -669,7 +693,8 @@ function applyCrawlV2Highlight(sheet, groups, guardPhrases) {
 
   var maxHelper = 60;
   sheet.getRange(1, CRAWL_FIRST_DETAIL, 1, maxHelper).breakApart().clearContent().clearFormat();
-  sheet.getRange(2, CRAWL_FIRST_DETAIL, 1, maxHelper).clearContent().clearFormat();
+  sheet.getRange(CRAWL_HEADER_ROW, CRAWL_FIRST_DETAIL, 1, maxHelper).clearContent().clearFormat();
+  sheet.getRange(CRAWL_TOTALS_ROW,  CRAWL_FIRST_DETAIL, 1, maxHelper).clearContent().clearFormat();
 
   var colNum = CRAWL_FIRST_DETAIL;
   parsed.forEach(function(g, groupIdx) {
@@ -679,14 +704,29 @@ function applyCrawlV2Highlight(sheet, groups, guardPhrases) {
     var termBg = isReview ? '#fff3cd' : (isNot ? '#fce8e6' : '#e8f0fe');
 
     g.terms.forEach(function(term) {
-      sheet.getRange(2, colNum)
-        .setFormula(buildTermFormulaV2(term, CRAWL_COL.TITLE, CRAWL_COL.ABSTRACT, guardPhrases))
+      // Header (row 2): plain term text — no longer embedded in the array
+      // formula (see buildTermFormulaV2), since the totals row now sits
+      // between it and the real data, and an array can't spill through a
+      // cell holding a separately-written formula.
+      sheet.getRange(CRAWL_HEADER_ROW, colNum)
+        .setValue(term)
         .setFontWeight('bold')
         .setHorizontalAlignment('center')
         .setVerticalAlignment('bottom')
         .setTextRotation(90)
         .setBackground(termBg)
         .setFontColor('#222');
+      // Totals (row 3): how many rows collected so far matched this term.
+      sheet.getRange(CRAWL_TOTALS_ROW, colNum)
+        .setFormula(buildColumnTotalFormula(colNum))
+        .setFontWeight('bold')
+        .setHorizontalAlignment('center')
+        .setBackground(termBg)
+        .setFontColor('#222');
+      // Data (row 4+): the actual per-row TRUE/FALSE array, anchored one
+      // row below the totals formula that reads it.
+      sheet.getRange(CRAWL_FIRST_DATA_ROW, colNum)
+        .setFormula(buildTermFormulaV2(term, CRAWL_COL.TITLE, CRAWL_COL.ABSTRACT, guardPhrases));
       sheet.setColumnWidth(colNum, 35);
       colNum++;
     });
@@ -710,16 +750,17 @@ function applyCrawlV2Highlight(sheet, groups, guardPhrases) {
   });
 
   if (colNum > CRAWL_FIRST_DETAIL) {
-    sheet.setRowHeight(2, 130);
+    sheet.setRowHeight(CRAWL_HEADER_ROW, 130);
 
-    var termDataRange = sheet.getRange(3, CRAWL_FIRST_DETAIL, sheet.getMaxRows() - 2, colNum - CRAWL_FIRST_DETAIL);
+    var dataRowCount = sheet.getMaxRows() - CRAWL_FIRST_DATA_ROW + 1;
+    var termDataRange = sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_FIRST_DETAIL, dataRowCount, colNum - CRAWL_FIRST_DETAIL);
     var startLetter = colToLetter(CRAWL_FIRST_DETAIL);
     var trueRule = SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied('=' + startLetter + '3=TRUE')
+      .whenFormulaSatisfied('=' + startLetter + CRAWL_FIRST_DATA_ROW + '=TRUE')
       .setBackground('#FFF176').setFontColor('#FFF176')
       .setRanges([termDataRange]).build();
     var falseRule = SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied('=' + startLetter + '3=FALSE')
+      .whenFormulaSatisfied('=' + startLetter + CRAWL_FIRST_DATA_ROW + '=FALSE')
       .setBackground('#FFFFFF').setFontColor('#FFFFFF')
       .setRanges([termDataRange]).build();
 
@@ -731,13 +772,13 @@ function applyCrawlV2Highlight(sheet, groups, guardPhrases) {
     // for clarity/defensiveness).
     var kLetter      = CRAWL_FILTER_MATCH_COL_LETTER; // "K" — from crawl.js
     var lLetter      = CRAWL_REVIEW_FLAG_COL_LETTER;  // "L" — from crawl.js
-    var fullRowRange = sheet.getRange(3, 1, sheet.getMaxRows() - 2, CRAWL_NUM_COLS);
+    var fullRowRange = sheet.getRange(CRAWL_FIRST_DATA_ROW, 1, dataRowCount, CRAWL_NUM_COLS);
     var trueRowRule = SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied('=AND($' + kLetter + '3=TRUE,$' + lLetter + '3=FALSE)')
+      .whenFormulaSatisfied('=AND($' + kLetter + CRAWL_FIRST_DATA_ROW + '=TRUE,$' + lLetter + CRAWL_FIRST_DATA_ROW + '=FALSE)')
       .setBackground('#b7e1cd') // green
       .setRanges([fullRowRange]).build();
     var reviewRowRule = SpreadsheetApp.newConditionalFormatRule()
-      .whenFormulaSatisfied('=AND($' + kLetter + '3=TRUE,$' + lLetter + '3=TRUE)')
+      .whenFormulaSatisfied('=AND($' + kLetter + CRAWL_FIRST_DATA_ROW + '=TRUE,$' + lLetter + CRAWL_FIRST_DATA_ROW + '=TRUE)')
       .setBackground('#ffe0b2') // orange
       .setRanges([fullRowRange]).build();
 
@@ -745,15 +786,18 @@ function applyCrawlV2Highlight(sheet, groups, guardPhrases) {
     // from a previous Apply Highlight Rule click) or any prior row-
     // highlight rule keyed on K or L (including the old tri-state text
     // forms ="TRUE"/="REVIEW", if this sheet predates the Match/Review
-    // split) — keep everything else (notably the no-abstract yellow-tint
-    // rule).
+    // split, or a row-3-anchored rule from before the totals row existed)
+    // — keep everything else (notably the no-abstract yellow-tint rule).
+    // Matches on the column letter alone (not a specific row number) so it
+    // catches a stale rule regardless of which row layout it was written
+    // under.
     var existingRules = sheet.getConditionalFormatRules().filter(function(rule) {
       if (rule.getRanges().some(function(r) { return r.getColumn() >= CRAWL_FIRST_DETAIL; })) return false;
       var bc = rule.getBooleanCondition();
       if (bc) {
         var vals    = bc.getCriteriaValues();
         var formula = vals && vals[0];
-        if (formula && (formula.indexOf('$' + kLetter + '3') !== -1 || formula.indexOf('$' + lLetter + '3') !== -1)) return false;
+        if (formula && (formula.indexOf('$' + kLetter) !== -1 || formula.indexOf('$' + lLetter) !== -1)) return false;
       }
       return true;
     });
@@ -763,16 +807,25 @@ function applyCrawlV2Highlight(sheet, groups, guardPhrases) {
   var filterFormula = buildFilterMatchFormulaV2(parsed, CRAWL_FIRST_DETAIL);
   var reviewFormula  = buildReviewFlagFormulaV2(parsed, CRAWL_FIRST_DETAIL);
   if (!filterFormula || !reviewFormula) return;
-  sheet.getRange(2, CRAWL_COL.FILTER_MATCH)
-    .setFormula(filterFormula)
-    .setFontWeight('bold')
-    .setBackground('#4285f4')
-    .setFontColor('white');
-  sheet.getRange(2, CRAWL_COL.REVIEW_FLAG)
-    .setFormula(reviewFormula)
-    .setFontWeight('bold')
-    .setBackground('#4285f4')
-    .setFontColor('white');
+  // Header (row 2) + totals (row 3) written directly, same reasoning as the
+  // term-helper columns above; the array itself (row 4+) no longer embeds
+  // its own header text.
+  sheet.getRange(CRAWL_HEADER_ROW, CRAWL_COL.FILTER_MATCH)
+    .setValue('Filter Match')
+    .setFontWeight('bold').setBackground('#4285f4').setFontColor('white');
+  sheet.getRange(CRAWL_TOTALS_ROW, CRAWL_COL.FILTER_MATCH)
+    .setFormula(buildColumnTotalFormula(CRAWL_COL.FILTER_MATCH))
+    .setFontWeight('bold').setBackground('#4285f4').setFontColor('white');
+  sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.FILTER_MATCH)
+    .setFormula(filterFormula);
+  sheet.getRange(CRAWL_HEADER_ROW, CRAWL_COL.REVIEW_FLAG)
+    .setValue('Review')
+    .setFontWeight('bold').setBackground('#4285f4').setFontColor('white');
+  sheet.getRange(CRAWL_TOTALS_ROW, CRAWL_COL.REVIEW_FLAG)
+    .setFormula(buildColumnTotalFormula(CRAWL_COL.REVIEW_FLAG))
+    .setFontWeight('bold').setBackground('#4285f4').setFontColor('white');
+  sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.REVIEW_FLAG)
+    .setFormula(reviewFormula);
 }
 
 // Attaches a Flag Reason note to the Review cell for a REVIEW row —
@@ -1378,10 +1431,10 @@ function runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yea
   var kept      = parseInt(props.getProperty(propPrefix + '_KEPT')     || '0');
 
   var lastRow = getCrawlLastDataRow(sheet);
-  if (lastRow < 3) return { status: 'complete', message: 'Backward pass complete. No papers found.' };
+  if (lastRow < CRAWL_FIRST_DATA_ROW) return { status: 'complete', message: 'Backward pass complete. No papers found.' };
 
-  var numRows = lastRow - 2;
-  var data    = sheet.getRange(3, 1, numRows, CRAWL_NUM_COLS).getValues();
+  var numRows = lastRow - CRAWL_FIRST_DATA_ROW + 1;
+  var data    = sheet.getRange(CRAWL_FIRST_DATA_ROW, 1, numRows, CRAWL_NUM_COLS).getValues();
 
   var existing        = getCrawlV2ExistingKeys(sheet);
   var paperIds         = [];
@@ -1397,7 +1450,7 @@ function runBackwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, yea
     var verdict  = jsMatchesFilterV2(title + ' ' + abstract, groups, guardPhrases);
     if (!verdict.expand) return; // only Filter Match=TRUE papers expand backward — REVIEW rows are terminal
     paperIds.push(id);
-    paperSheetRows.push(3 + i);
+    paperSheetRows.push(CRAWL_FIRST_DATA_ROW + i);
     paperDepths.push(depth);
   });
 
@@ -1631,10 +1684,10 @@ function runForwardPassV2(sheet, groups, guardPhrases, maxDepth, maxPapers, matc
 function runAbstractRetrySweep(sheet, startIdx) {
   var startTime = Date.now();
   var lastRow   = getCrawlLastDataRow(sheet);
-  if (lastRow < 3) return { status: 'complete', recovered: 0, nextIdx: 0 };
-  var numRows = lastRow - 2;
-  var idCol   = sheet.getRange(3, CRAWL_COL.ID,       numRows, 1).getValues();
-  var absCol  = sheet.getRange(3, CRAWL_COL.ABSTRACT, numRows, 1).getValues();
+  if (lastRow < CRAWL_FIRST_DATA_ROW) return { status: 'complete', recovered: 0, nextIdx: 0 };
+  var numRows = lastRow - CRAWL_FIRST_DATA_ROW + 1;
+  var idCol   = sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.ID,       numRows, 1).getValues();
+  var absCol  = sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.ABSTRACT, numRows, 1).getValues();
   var recovered = 0;
   var i = startIdx || 0;
 
@@ -1652,7 +1705,7 @@ function runAbstractRetrySweep(sheet, startIdx) {
     if (!externalIds) continue;
 
     var lookup = fetchOpenAlexAbstractV2(externalIds);
-    var row = 3 + i;
+    var row = CRAWL_FIRST_DATA_ROW + i;
     if (lookup.abstract) {
       sheet.getRange(row, CRAWL_COL.ABSTRACT).setValue(lookup.abstract)
         .setNote(describeAbstractSource(lookup) + ' (recovered on final retry sweep)');
@@ -2018,9 +2071,9 @@ function startCrawlV2(seeds, maxDepth, maxPapers, groups, crawlName, options) {
     // pass (once the trigger starts) adds more seeds on top of these.
     if (seeds.length > 0) {
       var seedRows = seeds.map(function(seed) { return crawlRowFromS2(seed, 0, '', 'K'); }); // from crawl.js
-      sheet.getRange(3, 1, seedRows.length, CRAWL_NUM_COLS).setValues(seedRows);
-      sheet.getRange(3, CRAWL_COL.CRAWLED, seedRows.length, 1).insertCheckboxes();
-      sheet.setRowHeights(3, seedRows.length, CRAWL_ROW_HEIGHT);
+      sheet.getRange(CRAWL_FIRST_DATA_ROW, 1, seedRows.length, CRAWL_NUM_COLS).setValues(seedRows);
+      sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.CRAWLED, seedRows.length, 1).insertCheckboxes();
+      sheet.setRowHeights(CRAWL_FIRST_DATA_ROW, seedRows.length, CRAWL_ROW_HEIGHT);
     }
 
     ss.setActiveSheet(sheet);

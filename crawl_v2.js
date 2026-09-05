@@ -610,12 +610,21 @@ function buildFilterExprPartsV2(parsedGroups, firstDetailColNum) {
     });
   }
 
-  // A group's own OR-across-terms, as a raw sum (>0 test applied by callers)
-  // — parenthesized whenever it's more than one range so it composes safely
-  // inside a larger arithmetic expression.
+  // A group's own OR-across-terms, as a raw sum (>0 test applied by callers).
+  // Always passes through a real '+' — even for a single-term group, where
+  // it'd be tempting to just return that one range bare — because Sheets
+  // does NOT coerce a bare boolean to 0/1 when comparing it directly with
+  // '>'/'<': it falls back to general value-type ordering, where ANY boolean
+  // ranks above ANY number regardless of TRUE/FALSE, so "FALSE>0" comes out
+  // TRUE. Confirmed live (single-term "undergraduate" NOT-group, whose own
+  // column read FALSE for every row, but "(AW4:AW)>0" read TRUE for every
+  // row) — this silently inverted the exclude check and made the whole
+  // Filter Match/Review formula FALSE for every single row. '+0' forces a
+  // genuine arithmetic sum even for one range, so it's always a real number
+  // by the time it's compared to zero.
   function groupSumExpr(gi) {
     const ranges = rangesForGroup(gi);
-    return ranges.length === 1 ? ranges[0] : ('(' + ranges.join('+') + ')');
+    return '(' + ranges.join('+') + '+0)';
   }
 
   const positiveIdx = parsedGroups.map(function(g, gi) { return g.not ? null : gi; })
@@ -638,12 +647,12 @@ function buildFilterExprPartsV2(parsedGroups, firstDetailColNum) {
   const excludeIdx = parsedGroups.map(function(g, gi) { return (g.not && (g.notMode || 'exclude') === 'exclude') ? gi : null; })
     .filter(function(x) { return x !== null; });
   const excludeRanges = flatRanges(excludeIdx);
-  const excludeMatchExpr = excludeRanges.length === 0 ? 'FALSE' : ('(' + excludeRanges.join('+') + ')>0');
+  const excludeMatchExpr = excludeRanges.length === 0 ? 'FALSE' : ('(' + excludeRanges.join('+') + '+0)>0');
 
   const reviewIdx = parsedGroups.map(function(g, gi) { return (g.not && g.notMode === 'review') ? gi : null; })
     .filter(function(x) { return x !== null; });
   const reviewRanges = flatRanges(reviewIdx);
-  const reviewMatchExpr = reviewRanges.length === 0 ? 'FALSE' : ('(' + reviewRanges.join('+') + ')>0');
+  const reviewMatchExpr = reviewRanges.length === 0 ? 'FALSE' : ('(' + reviewRanges.join('+') + '+0)>0');
 
   return { positiveMatchExpr: positiveMatchExpr, excludeMatchExpr: excludeMatchExpr, reviewMatchExpr: reviewMatchExpr };
 }

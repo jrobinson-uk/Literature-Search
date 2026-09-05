@@ -577,60 +577,75 @@ function buildColumnTotalFormula(colNum) {
   return '=COUNTIF(' + l + CRAWL_FIRST_DATA_ROW + ':' + l + ',TRUE)';
 }
 
-// Shared building blocks for both the Filter Match and Review-flag MAP
-// formulas — same params/ranges/positive/exclude/review expressions, just
-// wired into two different final booleans below. Kept as one function so
-// the two formulas (and jsMatchesFilterV2's own rule order) can't drift out
-// of sync with each other.
+// Shared building blocks for both the Filter Match and Review-flag formulas.
+//
+// Deliberately NOT a MAP/LAMBDA over one param per term any more (that's
+// what the pre-totals-row version did, successfully, for years — but a live
+// test straight after the totals-row deploy came back with Filter
+// Match/Review blank for every single row, on a crawl with 5 filter groups
+// / 37 total terms, i.e. a ~38-argument MAP/LAMBDA call). The per-term
+// columns' OWN formulas (buildTermFormulaV2, only 3 params: a/t/k) kept
+// working fine on the same crawl — the one thing that changed for THIS
+// formula specifically, versus the term formulas, is the argument count.
+// Never conclusively root-caused (no live Sheets access to inspect the
+// actual cell state), but that's the one variable that survived every
+// other elimination pass (anchor row, the removed ROW(a)=2 header-embed
+// trick — both also changed in buildTermFormulaV2, which still works).
+// Rather than ship a fix riding on an unconfirmed theory, this rebuilds the
+// combination step on a completely different, much more boring mechanism:
+// plain range arithmetic under ARRAYFORMULA (TRUE/FALSE coerce to 1/0, so
+// "sum of a group's term columns > 0" is OR, and multiplying groups'
+// results together is AND) — no LAMBDA, no per-term named parameters, so
+// whatever the actual limit/quirk was, this can't hit it.
 function buildFilterExprPartsV2(parsedGroups, firstDetailColNum) {
   const totalTerms = parsedGroups.reduce(function(s, g) { return s + g.terms.length; }, 0);
   if (totalTerms === 0) return null;
 
-  const params = parsedGroups.map(function(g, gi) {
-    return g.terms.map(function(t, ti) {
-      const idx = parsedGroups.slice(0, gi).reduce(function(s, pg) { return s + pg.terms.length; }, 0) + ti;
-      return makeParamName(idx); // from snowball.js
-    });
-  });
-
-  const ranges = params.map(function(groupParams, gi) {
-    return groupParams.map(function(p, ti) {
-      const colNum = firstDetailColNum +
-        parsedGroups.slice(0, gi).reduce(function(s, pg) { return s + pg.terms.length; }, 0) + ti;
+  function rangesForGroup(gi) {
+    const startOffset = parsedGroups.slice(0, gi).reduce(function(s, pg) { return s + pg.terms.length; }, 0);
+    return parsedGroups[gi].terms.map(function(t, ti) {
+      const colNum = firstDetailColNum + startOffset + ti;
       const l = colToLetter(colNum); // from snowball.js
-      // Starts at CRAWL_FIRST_DATA_ROW, matching buildTermFormulaV2's own
-      // anchor — the term column's row 2 (static header text) and row 3
-      // (its own totals number) are never fed into this AND/OR reduction.
       return l + CRAWL_FIRST_DATA_ROW + ':' + l;
-    }).join(',');
-  }).join(',');
+    });
+  }
 
-  const allParams = 'a,' + params.map(function(gp) { return gp.join(','); }).join(',');
-
-  function orExprFor(gi) {
-    const gParams = params[gi];
-    return gParams.length === 1 ? gParams[0] : ('OR(' + gParams.join(',') + ')');
+  // A group's own OR-across-terms, as a raw sum (>0 test applied by callers)
+  // — parenthesized whenever it's more than one range so it composes safely
+  // inside a larger arithmetic expression.
+  function groupSumExpr(gi) {
+    const ranges = rangesForGroup(gi);
+    return ranges.length === 1 ? ranges[0] : ('(' + ranges.join('+') + ')');
   }
 
   const positiveIdx = parsedGroups.map(function(g, gi) { return g.not ? null : gi; })
     .filter(function(x) { return x !== null; });
-  const positiveExpr = positiveIdx.length === 0
-    ? 'TRUE'
-    : (positiveIdx.length === 1 ? orExprFor(positiveIdx[0]) : ('AND(' + positiveIdx.map(orExprFor).join(',') + ')'));
+  // Product of "(group sum > 0)" across every positive group — 1 only if
+  // EVERY positive group had at least one term match (AND), 0 if any didn't.
+  const positiveMatchExpr = positiveIdx.length === 0
+    ? '1'
+    : positiveIdx.map(function(gi) { return '(' + groupSumExpr(gi) + '>0)'; }).join('*');
+
+  // Exclude/review only ever need "did ANY term across ALL such groups
+  // match" (an OR of ORs is just one flat OR), so their terms are combined
+  // into a single flat sum rather than kept per-group.
+  function flatRanges(idxList) {
+    var out = [];
+    idxList.forEach(function(gi) { out = out.concat(rangesForGroup(gi)); });
+    return out;
+  }
 
   const excludeIdx = parsedGroups.map(function(g, gi) { return (g.not && (g.notMode || 'exclude') === 'exclude') ? gi : null; })
     .filter(function(x) { return x !== null; });
-  const excludeExpr = excludeIdx.length === 0
-    ? 'FALSE'
-    : (excludeIdx.length === 1 ? orExprFor(excludeIdx[0]) : ('OR(' + excludeIdx.map(orExprFor).join(',') + ')'));
+  const excludeRanges = flatRanges(excludeIdx);
+  const excludeMatchExpr = excludeRanges.length === 0 ? 'FALSE' : ('(' + excludeRanges.join('+') + ')>0');
 
   const reviewIdx = parsedGroups.map(function(g, gi) { return (g.not && g.notMode === 'review') ? gi : null; })
     .filter(function(x) { return x !== null; });
-  const reviewExpr = reviewIdx.length === 0
-    ? 'FALSE'
-    : (reviewIdx.length === 1 ? orExprFor(reviewIdx[0]) : ('OR(' + reviewIdx.map(orExprFor).join(',') + ')'));
+  const reviewRanges = flatRanges(reviewIdx);
+  const reviewMatchExpr = reviewRanges.length === 0 ? 'FALSE' : ('(' + reviewRanges.join('+') + ')>0');
 
-  return { ranges: ranges, allParams: allParams, positiveExpr: positiveExpr, excludeExpr: excludeExpr, reviewExpr: reviewExpr };
+  return { positiveMatchExpr: positiveMatchExpr, excludeMatchExpr: excludeMatchExpr, reviewMatchExpr: reviewMatchExpr };
 }
 
 // Pure boolean (split from the old tri-state text column into two orthogonal
@@ -644,12 +659,11 @@ function buildFilterExprPartsV2(parsedGroups, firstDetailColNum) {
 function buildFilterMatchFormulaV2(parsedGroups, firstDetailColNum) {
   const parts = buildFilterExprPartsV2(parsedGroups, firstDetailColNum);
   if (!parts) return null;
-  const stateExpr = 'IF(NOT(' + parts.positiveExpr + '),FALSE,IF(' + parts.excludeExpr + ',FALSE,TRUE))';
-  // Anchored at CRAWL_FIRST_DATA_ROW like the term columns it reads (see
-  // buildTermFormulaV2) — header text and the totals-row COUNTIF are written
-  // separately by the caller, same reasoning as there.
-  return '=MAP(A' + CRAWL_FIRST_DATA_ROW + ':A,' + parts.ranges + ',LAMBDA(' + parts.allParams + ',' +
-         'IF(a="","",' + stateExpr + ')))';
+  // Header text and the totals-row COUNTIF are written separately by the
+  // caller — this array owns only the real data rows, same as buildTermFormulaV2.
+  return '=ARRAYFORMULA(IF(A' + CRAWL_FIRST_DATA_ROW + ':A="","",' +
+         'IF(' + parts.positiveMatchExpr + '=0,FALSE,' +
+         'IF(' + parts.excludeMatchExpr + ',FALSE,TRUE))))';
 }
 
 // Pure boolean, orthogonal to Filter Match: TRUE iff the paper is in scope
@@ -660,9 +674,9 @@ function buildFilterMatchFormulaV2(parsedGroups, firstDetailColNum) {
 function buildReviewFlagFormulaV2(parsedGroups, firstDetailColNum) {
   const parts = buildFilterExprPartsV2(parsedGroups, firstDetailColNum);
   if (!parts) return null;
-  const stateExpr = 'IF(NOT(' + parts.positiveExpr + '),FALSE,IF(' + parts.excludeExpr + ',FALSE,' + parts.reviewExpr + '))';
-  return '=MAP(A' + CRAWL_FIRST_DATA_ROW + ':A,' + parts.ranges + ',LAMBDA(' + parts.allParams + ',' +
-         'IF(a="","",' + stateExpr + ')))';
+  return '=ARRAYFORMULA(IF(A' + CRAWL_FIRST_DATA_ROW + ':A="","",' +
+         'IF(' + parts.positiveMatchExpr + '=0,FALSE,' +
+         'IF(' + parts.excludeMatchExpr + ',FALSE,' + parts.reviewMatchExpr + '))))';
 }
 
 // Replaces the shared applyCrawlHighlight (v1, archived) — identical term-

@@ -2094,7 +2094,15 @@ function startCrawlV2(seeds, maxDepth, maxPapers, groups, crawlName, options) {
     // pass (once the trigger starts) adds more seeds on top of these.
     if (seeds.length > 0) {
       var seedRows = seeds.map(function(seed) { return crawlRowFromS2(seed, 0, '', 'K'); }); // from crawl.js
-      sheet.getRange(CRAWL_FIRST_DATA_ROW, 1, seedRows.length, CRAWL_NUM_COLS).setValues(seedRows);
+      // Cols FILTER_MATCH/REVIEW_FLAG skipped here too, same reasoning as
+      // writeCrawlRows (crawl.js) — this write happens before
+      // applyCrawlV2Highlight has placed its array formulas, so it isn't
+      // the exact bug that hits there, but leaving those two columns alone
+      // consistently everywhere removes any doubt.
+      var seedBefore = seedRows.map(function(r) { return r.slice(0, CRAWL_COL.FILTER_MATCH - 1); });
+      var seedAfter  = seedRows.map(function(r) { return r.slice(CRAWL_COL.REVIEW_FLAG); });
+      sheet.getRange(CRAWL_FIRST_DATA_ROW, 1, seedRows.length, CRAWL_COL.FILTER_MATCH - 1).setValues(seedBefore);
+      sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.REVIEW_FLAG + 1, seedRows.length, seedAfter[0].length).setValues(seedAfter);
       sheet.getRange(CRAWL_FIRST_DATA_ROW, CRAWL_COL.CRAWLED, seedRows.length, 1).insertCheckboxes();
       sheet.setRowHeights(CRAWL_FIRST_DATA_ROW, seedRows.length, CRAWL_ROW_HEIGHT);
     }

@@ -330,7 +330,28 @@ function countUncrawled(sheet) {
 function writeCrawlRows(sheet, rows) {
   if (rows.length === 0) return null;
   const startRow = getCrawlLastDataRow(sheet) + 1;
-  sheet.getRange(startRow, 1, rows.length, CRAWL_NUM_COLS).setValues(rows);
+  // Cols FILTER_MATCH/REVIEW_FLAG (11-12) are deliberately skipped here, not
+  // written as part of the same setValues() call as everything else. Those
+  // two columns are owned by the array formulas applyCrawlV2Highlight
+  // anchors at CRAWL_FIRST_DATA_ROW — for every row after the very first,
+  // writing "" into a cell that array has already spilled into is harmless,
+  // but for the FIRST EVER row this function writes to an empty sheet,
+  // startRow is CRAWL_FIRST_DATA_ROW itself — the exact anchor cell, not
+  // just a spilled one — and setValues() there doesn't cross the array's
+  // spill, it overwrites the formula's own home cell outright, silently
+  // deleting Filter Match/Review for the whole crawl. Confirmed live: this
+  // is exactly what was happening (header row 2 and totals row 3 survived
+  // untouched since nothing ever writes to those rows; row 4 didn't).
+  // Splitting the write in two, leaving the 11-12 gap alone, means this
+  // function touches those columns no more than it already leaves the
+  // term-helper columns (17+) alone — the array formulas' own auto-
+  // expanding spill fills them in, same mechanism, same reason it works.
+  const gapStart = CRAWL_COL.FILTER_MATCH;      // 11
+  const gapEnd   = CRAWL_COL.REVIEW_FLAG;       // 12
+  const before = rows.map(function(r) { return r.slice(0, gapStart - 1); });        // cols 1..10
+  const after  = rows.map(function(r) { return r.slice(gapEnd); });                 // cols 13..15
+  sheet.getRange(startRow, 1, rows.length, gapStart - 1).setValues(before);
+  sheet.getRange(startRow, gapEnd + 1, rows.length, after[0].length).setValues(after);
   sheet.getRange(startRow, CRAWL_COL.CRAWLED, rows.length, 1).insertCheckboxes();
   sheet.setRowHeights(startRow, rows.length, CRAWL_ROW_HEIGHT);
   var range = sheet.getRange(startRow, 1, rows.length, CRAWL_NUM_COLS);

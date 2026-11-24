@@ -56,6 +56,8 @@ const OPENALEX_BACKOFF_MS_V2 = [1000, 2000, 4000, 8000, 15000, 30000];
 // with all of them left off reproduces today's (v19) behaviour exactly.
 const PHASE0_YEAR_FROM_DEFAULT = 2023;
 const PHASE0_YEAR_TO_DEFAULT   = 2026;
+// Bump if the shape of the logged crawl settings object changes.
+const CRAWL_SETTINGS_VERSION = 1;
 // A-priori venue list from the v3 brief — added regardless of whether they
 // were represented in the v19 run. The other ~48 venues the brief derived
 // from v19 (those with ≥5 matches) aren't available here since that export
@@ -2011,12 +2013,53 @@ function startCrawlV2(seeds, maxDepth, maxPapers, groups, crawlName, options) {
     var yearFloor   = yearFromOverride || autoYearFloor;
     var yearCeiling = yearToOverride;
 
-    var sheetName = (crawlName || '').trim() || ('v2 ' + newCrawlSheetName()); // newCrawlSheetName from crawl.js
+    var ss        = SpreadsheetApp.getActiveSpreadsheet();
+    var baseName  = (crawlName || '').trim() || ('v2 ' + newCrawlSheetName()); // newCrawlSheetName from crawl.js
+    // A name restored from the log usually still has its old sheet, and
+    // insertSheet() throws on a duplicate — suffix " (2)", " (3)", … instead.
+    var sheetName = baseName;
+    for (var nameSuffix = 2; ss.getSheetByName(sheetName); nameSuffix++) {
+      sheetName = baseName + ' (' + nameSuffix + ')';
+    }
     var seedLabel = seeds.length
       ? (seeds.length === 1 ? (seeds[0].title || 'Unknown') : seeds.length + ' hand-picked seed(s) + keyword pass')
       : 'Keyword pass (exhaustive boolean search)';
 
-    var ss    = SpreadsheetApp.getActiveSpreadsheet();
+    var seedIds = seeds.map(function(s) {
+      var mag = s.externalIds && s.externalIds.MAG;
+      return mag ? ('W' + mag) : ('S2:' + s.paperId);
+    });
+
+    // Every setting this crawl was started with, exactly as the panel sent
+    // it — written into the log's Resume Code so "Load Selected Log Row" /
+    // a pasted code can restore the identical search. See
+    // applyCrawlSettingsToProps_ (log.js) and applyReplay (panel).
+    var crawlSettings = {
+      v:                    CRAWL_SETTINGS_VERSION,
+      name:                 (crawlName || '').trim(),
+      seedsStr:             seedIds.join(' | '),
+      maxDepth:             maxDepth || 2,
+      backwardDepth:        backwardMaxDepth,
+      maxPapers:            maxPapers || 300,
+      runVenuePhase:        runVenuePhase,
+      runBackwardPhase:     runBackwardPhase,
+      runForwardPhase:      runForwardPhase,
+      phase0Venues:         phase0Venues,
+      phase0YearFrom:       phase0YearFrom,
+      phase0YearTo:         phase0YearTo,
+      logNonMatchVenue:     !matchesOnlyVenue,
+      logNonMatchKeyword:   !matchesOnlyKeyword,
+      logNonMatchBackward:  !matchesOnlyBackward,
+      logNonMatchForward:   !matchesOnlyForward,
+      yearBound:            yearBound,
+      yearFrom:             yearFromOverride || '',   // '' = blank in the panel (auto from seeds)
+      yearTo:               yearToOverride   || '',   // '' = blank in the panel (present day)
+      effectiveYearFloor:   yearFloor,                // what the crawl actually used
+      effectiveYearCeiling: yearCeiling,
+      filterGroups:         groups || [],
+      guardPhrases:         guardPhrases
+    };
+
     var sheet = ss.insertSheet(sheetName);
     setupCrawlV2Sheet(sheet, seedLabel);
 
@@ -2074,16 +2117,15 @@ function startCrawlV2(seeds, maxDepth, maxPapers, groups, crawlName, options) {
     props.setProperty('CRAWL2_VENUE_COUNT',      '0');
 
     var logRow = appendLogRow('CrawlV2', {
-      name:          sheetName,
-      seeds:         seeds.map(function(s) {
-        var mag = s.externalIds && s.externalIds.MAG;
-        return mag ? ('W' + mag) : ('S2:' + s.paperId);
-      }),
+      name:          sheetName,   // the actual sheet tab (resume looks it up by this)
+      seeds:         seedIds,
       depth:         maxDepth,
       maxPapers:     maxPapers,
       filterGroups:  groups,
-      runBackward:   true,   // backward now always runs, both before and after forward
-      expandBackward: true
+      // Second backward pass only runs when both backward and forward do.
+      runBackward:    runBackwardPhase,
+      expandBackward: runBackwardPhase && runForwardPhase,
+      settings:      crawlSettings
     });
     if (logRow) props.setProperty('CRAWL2_LOG_ROW', String(logRow));
 

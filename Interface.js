@@ -1,5 +1,5 @@
 const debugMode = true;
-const VERSION = "1.12.0";
+const VERSION = "1.13.0";
 
 /**
  * Runs automatically when the sheet is opened.

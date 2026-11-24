@@ -397,6 +397,7 @@
       var seeds         = [];    // hand-picked S2 paper objects, optional supplement
       var currentPaper  = null;
       var pendingBatch  = [];
+      var guardPhrasesFromReplay = false; // see applyReplay / guard-phrase loader
 
       // ── Section toggling ──────────────────────────────────────
       function toggleSection(bodyId, headerId) {
@@ -885,6 +886,9 @@
       // then silently persist that emptiness over a working value.
       google.script.run
         .withSuccessHandler(function(guardPhrases) {
+          // Don't clobber guard phrases a log replay has already restored
+          // (this call and the replay chain race on panel load).
+          if (guardPhrasesFromReplay) return;
           document.getElementById('guardPhrases').value = (guardPhrases || []).join(', ');
         })
         .withFailureHandler(function() {})
@@ -920,31 +924,92 @@
       }
 
       // ── Log replay ────────────────────────────────────────────
+      // Restores every setting the log row recorded. Rows from v1.13.0+
+      // carry a full `settings` snapshot; older rows only have name, seeds,
+      // depth, max papers and filter groups. Anything not recorded is left
+      // as the panel currently shows it, and listed in the status message.
       function applyReplay(replay) {
-        var nameEl = document.getElementById('crawlName');
-        if (replay.name) nameEl.value = replay.name;
+        var s = replay.settings || {};
+        var notRecorded = [];
+        function has(v) { return v !== undefined && v !== null; }
+        function pick(primary, fallback) { return has(primary) ? primary : fallback; }
+        // blankIsValue: '' means "left blank on purpose" (seed-year boxes),
+        // rather than "not recorded" (an empty cell on an old log row).
+        function setValue(id, v, label, blankIsValue) {
+          if (has(v) && (v !== '' || blankIsValue)) document.getElementById(id).value = v;
+          else notRecorded.push(label);
+        }
+        function setChecked(id, v, label) {
+          if (typeof v === 'boolean') document.getElementById(id).checked = v;
+          else notRecorded.push(label);
+        }
+        function setList(id, v, label) {
+          if (Array.isArray(v)) document.getElementById(id).value = v.join(', ');
+          else notRecorded.push(label);
+        }
 
-        if (replay.depth)     document.getElementById('crawlMaxDepth').value  = replay.depth;
-        if (replay.maxPapers) document.getElementById('crawlMaxPapers').value = replay.maxPapers;
+        // Prefer the typed name; old rows only have the sheet tab name.
+        setValue('crawlName',          pick(s.name, replay.name),          'Name');
+        setValue('crawlMaxDepth',      pick(s.maxDepth, replay.depth),     'Max depth');
+        setValue('crawlBackwardDepth', s.backwardDepth,                    'Backward depth');
+        setValue('crawlMaxPapers',     pick(s.maxPapers, replay.maxPapers),'Max papers');
 
-        if (replay.filterGroups && replay.filterGroups.length > 0) {
+        setChecked('runVenuePhase',    s.runVenuePhase,    'Venue sweep on/off');
+        setChecked('runBackwardPhase', s.runBackwardPhase, 'Backward pass on/off');
+        setChecked('runForwardPhase',  s.runForwardPhase,  'Forward pass on/off');
+
+        setList ('phase0Venues',       s.phase0Venues,     'Venue list');
+        setValue('phase0YearFrom',     s.phase0YearFrom,   'Venue sweep year from');
+        setValue('phase0YearTo',       s.phase0YearTo,     'Venue sweep year to');
+
+        setChecked('logNonMatchVenue',    s.logNonMatchVenue,    'Log non-matches: venue');
+        setChecked('logNonMatchKeyword',  s.logNonMatchKeyword,  'Log non-matches: keyword');
+        setChecked('logNonMatchBackward', s.logNonMatchBackward, 'Log non-matches: backward');
+        setChecked('logNonMatchForward',  s.logNonMatchForward,  'Log non-matches: forward');
+
+        setChecked('yearBoundCheck',   s.yearBound,        'Bound by seed year');
+        toggleYearRange();
+        // '' is a real value here: the box was left blank (auto).
+        setValue('crawlYearFrom',      s.yearFrom,         'Seed year from', true);
+        setValue('crawlYearTo',        s.yearTo,           'Seed year to',   true);
+
+        if (Array.isArray(s.guardPhrases)) {
+          guardPhrasesFromReplay = true;
+          document.getElementById('guardPhrases').value = s.guardPhrases.join(', ');
+        } else {
+          notRecorded.push('Guard phrases');
+        }
+
+        var groupsToRestore = pick(s.filterGroups, replay.filterGroups);
+        if (groupsToRestore && groupsToRestore.length > 0) {
           document.getElementById('groupsContainer').innerHTML = '';
           groupCount = 0;
-          replay.filterGroups.forEach(function(g) { addGroup(g); });
+          groupsToRestore.forEach(function(g) { addGroup(g); });
+        } else {
+          notRecorded.push('Filter groups');
         }
         updateStartButtonState();
 
-        if (replay.canResume) {
-          setStatus(
-            'Replay loaded from log — settings restored.\n\n' +
-            'RESUME: Click "Resume v2 Crawl" to continue the existing crawl sheet.\n\n' +
-            'FRESH RUN: re-resolving any hand-picked seeds below — click "Start v2 Crawl" once ready for a new sheet with the same settings.'
-          );
-        } else {
-          setStatus('Replay loaded from log — settings restored.');
+        var baseMsg = replay.settings
+          ? 'Replay loaded from log: all settings restored.'
+          : 'Replay loaded from an older log row: restored what it recorded.\n\n' +
+            'Not recorded, left as currently shown: ' + notRecorded.join(', ') + '.';
+        if (replay.settings && notRecorded.length) {
+          baseMsg += '\n\nNot in this log row, left as currently shown: ' + notRecorded.join(', ') + '.';
         }
+        if (replay.canResume) {
+          baseMsg += '\n\nRESUME: Click "Resume v2 Crawl" to continue the existing crawl sheet.\n' +
+            'FRESH RUN: click "Start v2 Crawl" for a new sheet with these settings ' +
+            '(a " (2)" suffix is added if the name is taken).';
+        }
+        setStatus(baseMsg);
 
-        var inputs = (replay.seedsStr || '')
+        // Replace, don't add to, whatever seeds the panel already had.
+        seeds = [];
+        renderSeedsList();
+        updateStartButtonState();
+
+        var inputs = (pick(s.seedsStr, replay.seedsStr) || '')
           .split('|').map(function(s) { return s.trim(); }).filter(Boolean);
         if (inputs.length === 0) return;
 
@@ -954,10 +1019,7 @@
         var restoredCount = 0;
         function refreshRestoreStatus() {
           setStatus(
-            restoredCount + ' of ' + inputs.length + ' hand-picked seed(s) restored.' +
-            (replay.canResume
-              ? '\n\nClick "Resume v2 Crawl" to continue the existing sheet, or "Start v2 Crawl" for a fresh one.'
-              : '')
+            restoredCount + ' of ' + inputs.length + ' hand-picked seed(s) restored.\n\n' + baseMsg
           );
         }
 

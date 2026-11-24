@@ -111,7 +111,10 @@ function appendLogRow(type, data) {
     maxPapers:    data.maxPapers    != null ? data.maxPapers : '',
     filterGroups: data.filterGroups || [],
     backwardPass: backwardLabel,
-    canResume:    false   // paste-in always starts a fresh run
+    canResume:    false,  // paste-in always starts a fresh run
+    // Full settings snapshot (crawls from v1.13.0 on). The legacy keys above
+    // stay for older readers; applyReplay prefers `settings` when present.
+    settings:     data.settings || undefined
   });
 
   sheet.getRange(lastRow, LOG_EXT.TYPE, 1, LOG_EXT_HEADERS.length).setValues([[
@@ -213,9 +216,18 @@ function resumeFromLog() {
   var filterGroupsStr = String(ext[5] || '').trim();
   var backwardPass    = String(ext[6] || '').trim();
   var status          = String(ext[7] || '').trim();
+  var resumeCodeStr   = String(ext[8] || '').trim();
 
   var filterGroups = [];
   try { if (filterGroupsStr) filterGroups = JSON.parse(filterGroupsStr); } catch (e) {}
+
+  // Full settings snapshot, if this row was logged by v1.13.0+. Older rows
+  // have none — the panel restores the columns above and reports the rest.
+  var settings = null;
+  try {
+    var resumeObj = resumeCodeStr ? JSON.parse(resumeCodeStr) : null;
+    if (resumeObj && resumeObj.settings) settings = resumeObj.settings;
+  } catch (e) {}
 
   var props      = PropertiesService.getScriptProperties();
   var canResume  = false;
@@ -235,16 +247,17 @@ function resumeFromLog() {
       // Mirrors the Crawl branch above, but into v2's own CRAWL2_* namespace
       // — a resumed v2 run must not touch the v1 CRAWL_* properties, so a
       // v1 crawl running at the same time is unaffected.
-      // Note: yearBound/yearFloor/yearCeiling/targetSeeds/phase aren't part
-      // of the Log sheet's schema, so a resumed run restarts from Phase 1
-      // (keyword) with year-bound defaults rather than exactly where it left
-      // off — same accepted limitation as v1's resumeFromLog.
+      // Rows from v1.13.0+ carry the full settings snapshot, so the resumed
+      // run gets every setting back. Older rows only have the columns
+      // above; anything else keeps whatever is in script properties.
+      // Progress state (phase, batch indices) is never touched here.
       props.setProperty('CRAWL2_ACTIVE_SHEET',  name);
       props.setProperty('CRAWL2_MAX_DEPTH',     String(depth      || 3));
       props.setProperty('CRAWL2_MAX_PAPERS',    String(maxPapers  || 300));
       props.setProperty('CRAWL2_FILTER_GROUPS', JSON.stringify(filterGroups));
       props.setProperty('CRAWL2_RUN_BACKWARD',  backwardPass !== 'None' ? 'true' : 'false');
       props.setProperty('CRAWL2_LOG_ROW',       String(row));
+      if (settings) applyCrawlSettingsToProps_(props, settings);
       canResume = true;
     }
   }
@@ -266,7 +279,8 @@ function resumeFromLog() {
     backwardPass: backwardPass,
     status:       status,
     logRow:       row,
-    canResume:    canResume        // true = incomplete crawl, Resume button will work
+    canResume:    canResume,       // true = incomplete crawl, Resume button will work
+    settings:     settings         // null for rows logged before v1.13.0
   };
 
   props.setProperty('LOG_REPLAY', JSON.stringify(replay));
@@ -286,4 +300,33 @@ function getLogReplay() {
   props.deleteProperty('LOG_REPLAY');
   try   { return JSON.parse(raw); }
   catch (e) { return null; }
+}
+
+// Writes a logged settings snapshot back into the CRAWL2_* settings
+// properties that crawlV2BatchTrigger reads, so a resumed crawl runs with
+// exactly the settings it was started with. Only keys present in the
+// snapshot are written. Mirrors the property writes in startCrawlV2.
+function applyCrawlSettingsToProps_(props, s) {
+  function setBool(key, v)  { if (typeof v === 'boolean') props.setProperty(key, v ? 'true' : 'false'); }
+  function setStr(key, v)   { if (v !== undefined && v !== null) props.setProperty(key, String(v)); }
+  function setJson(key, v)  { if (Array.isArray(v)) props.setProperty(key, JSON.stringify(v)); }
+
+  setStr ('CRAWL2_MAX_DEPTH',             s.maxDepth);
+  setStr ('CRAWL2_BACKWARD_MAX_DEPTH',    s.backwardDepth);
+  setStr ('CRAWL2_MAX_PAPERS',            s.maxPapers);
+  setJson('CRAWL2_FILTER_GROUPS',         s.filterGroups);
+  setJson('CRAWL2_GUARD_PHRASES',         s.guardPhrases);
+  setBool('CRAWL2_RUN_VENUE_PHASE',       s.runVenuePhase);
+  setBool('CRAWL2_RUN_BACKWARD_PHASE',    s.runBackwardPhase);
+  setBool('CRAWL2_RUN_FORWARD_PHASE',     s.runForwardPhase);
+  if (typeof s.logNonMatchVenue    === 'boolean') setBool('CRAWL2_MATCHES_ONLY_VENUE',    !s.logNonMatchVenue);
+  if (typeof s.logNonMatchKeyword  === 'boolean') setBool('CRAWL2_MATCHES_ONLY_KEYWORD',  !s.logNonMatchKeyword);
+  if (typeof s.logNonMatchBackward === 'boolean') setBool('CRAWL2_MATCHES_ONLY_BACKWARD', !s.logNonMatchBackward);
+  if (typeof s.logNonMatchForward  === 'boolean') setBool('CRAWL2_MATCHES_ONLY_FORWARD',  !s.logNonMatchForward);
+  setBool('CRAWL2_YEAR_BOUND',            s.yearBound);
+  setStr ('CRAWL2_YEAR_FLOOR',            s.effectiveYearFloor);
+  setStr ('CRAWL2_YEAR_CEILING',          s.effectiveYearCeiling);
+  setJson('CRAWL2_PHASE0_VENUES',         s.phase0Venues);
+  setStr ('CRAWL2_PHASE0_YEAR_FROM',      s.phase0YearFrom);
+  setStr ('CRAWL2_PHASE0_YEAR_TO',        s.phase0YearTo);
 }

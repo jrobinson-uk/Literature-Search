@@ -8,3 +8,7 @@
 # executed. skipSubdirectories already excludes it; listed here too for
 # the same belt-and-braces reason as .claude/ above.
 archive/
+
+# Local tooling: never pushed to Apps Script.
+node_modules/
+scripts/

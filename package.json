@@ -1,0 +1,15 @@
+{
+  "name": "literature-search",
+  "private": true,
+  "description": "Google Sheets Scholar search + OpenAlex snowball (Apps Script)",
+  "scripts": {
+    "login:work": "clasp login",
+    "login:personal": "clasp -u personal login",
+    "push:work": "node scripts/stamp-version.js work && clasp push",
+    "push:personal": "node scripts/stamp-version.js personal && clasp -u personal -P \"$PWD/.clasp.personal.json\" push",
+    "push:all": "npm run push:work && npm run push:personal"
+  },
+  "devDependencies": {
+    "@google/clasp": "^3.4.1"
+  }
+}
